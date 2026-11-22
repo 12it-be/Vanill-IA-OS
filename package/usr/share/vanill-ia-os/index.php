@@ -156,7 +156,18 @@ header('X-Content-Type-Options: nosniff');
 
   <!-- Power & Session Menu -->
   <div id="powerPopover" class="power-popover hidden">
-    <button type="button" class="ctx-item" data-power="settings" data-i18n="power.settings">Security, Language & Appearance</button>
+    <button type="button" class="ctx-item" data-power="settings" data-i18n="power.settings">Security, Language &amp; Appearance</button>
+    <a href="https://github.com/12it-be/Vanill-ia-OS" target="_blank" rel="noopener noreferrer" class="ctx-item" data-power="github" style="text-decoration:none;color:inherit;justify-content:space-between;">
+      <span style="display:inline-flex;align-items:center;gap:8px;">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M15 22v-4a4.8 4.8 0 0 0-1-3.5c3 0 6-2 6-5.5.08-1.25-.27-2.48-1-3.5.28-1.15.28-2.35 0-3.5 0 0-1 0-3 1.5-2.64-.5-5.36-.5-8 0C6 2 5 2 5 2c-.3 1.15-.3 2.35 0 3.5A5.403 5.403 0 0 0 4 9c0 3.5 3 5.5 6 5.5-.39.49-.68 1.05-.85 1.65-.17.6-.22 1.23-.15 1.85v4"></path>
+          <path d="M9 18c-4.51 2-5-2-7-2"></path>
+        </svg>
+        <span data-i18n="power.github">GitHub Repository</span>
+      </span>
+      <span style="opacity:0.65;font-size:0.75rem;">↗</span>
+    </a>
+    <div class="ctx-sep"></div>
     <button type="button" class="ctx-item" data-power="lock" data-i18n="power.lock">Lock Screen</button>
     <button type="button" class="ctx-item" data-power="logout" data-i18n="power.logout">Sign Out</button>
     <div class="ctx-sep"></div>

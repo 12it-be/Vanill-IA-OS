@@ -41,13 +41,13 @@ curl -fsSL https://install.vanill-ia.com/install.sh | sudo bash -s -- --with-doc
 
 ```bash
 # Build natively on Debian / Ubuntu via dpkg-deb:
-bash build.sh 1.7.0
+bash build.sh 1.7.1
 
 # Or build portably via Node.js:
-node build-deb.mjs 1.7.0
+node build-deb.mjs 1.7.1
 
 # Install a local .deb package:
-sudo bash install.sh --local ./dist/vanill-ia-os_1.7.0_all.deb
+sudo bash install.sh --local ./dist/vanill-ia-os_1.7.1_all.deb
 sudo caddy validate --config /etc/caddy/Caddyfile
 ```
 

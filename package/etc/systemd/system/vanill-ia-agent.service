@@ -1,6 +1,6 @@
 [Unit]
 Description=Vanill-IA OS Privileged System Daemon
-Documentation=https://gitea.jn-dev.be/JN/Vanill-IA-OS
+Documentation=https://github.com/12it-be/Vanill-ia-OS
 After=network.target local-fs.target docker.service
 
 [Service]

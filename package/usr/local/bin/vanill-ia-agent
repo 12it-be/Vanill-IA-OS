@@ -37,7 +37,7 @@ final class AgentError extends RuntimeException
 
 final class VanillIAAgent
 {
-    public const VERSION = '1.7.0';
+    public const VERSION = '1.7.1';
     private const SOCKET_DIR = '/run/vanill-ia';
     private const SOCKET_PATH = '/run/vanill-ia/agent.sock';
     private const DOCKER_SOCKET = '/var/run/docker.sock';

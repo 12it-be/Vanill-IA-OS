@@ -107,6 +107,7 @@
   },
   "power": {
     "settings": "Sécurité, Langue & Apparence",
+    "github": "Dépôt GitHub",
     "lock": "Verrouiller l'écran",
     "logout": "Fermer la session",
     "reboot": "Redémarrer Debian",
