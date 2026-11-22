@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Vanill-IA OS — Debian / Ubuntu / Raspberry Pi OS Post-Installation Script
+# ==============================================================================
+set -euo pipefail
+
+APP_DIR="/usr/share/vanill-ia-os"
+ENV_HELPER="${APP_DIR}/lib/env-detect.sh"
+DATA_ROOT="/var/lib/vanill-ia-os"
+DB_PATH="${DATA_ROOT}/data/vanill-ia.db"
+SECRET_KEY_FILE="${DATA_ROOT}/data/.secret.key"
+SETUP_TOKEN_FILE="${DATA_ROOT}/data/setup.token"
+AUTH_LOG="/var/log/vanill-ia-auth.log"
+SCHEMA_PATH="${APP_DIR}/config/schema.sql"
+CADDY_MAIN="/etc/caddy/Caddyfile"
+CADDY_CONF="/etc/caddy/conf.d/vanill-ia-os.caddy"
+CADDY_BROWSER_CONF="/etc/caddy/conf.d/vanill-ia-browser.caddy"
+OPT_DIR="/opt/vanill-ia"
+
+if [[ -f "${ENV_HELPER}" ]]; then
+    # shellcheck source=/dev/null
+    . "${ENV_HELPER}"
+fi
+
+case "${1:-}" in
+    configure)
+        echo "[Vanill-IA OS] Configuring directories and runtime environment..."
+
+        mkdir -p \
+            "${DATA_ROOT}/data" \
+            "${DATA_ROOT}/apps" \
+            "${DATA_ROOT}/notes" \
+            "${DATA_ROOT}/stacks" \
+            "${DATA_ROOT}/tmp" \
+            "${DATA_ROOT}/sessions" \
+            "/etc/caddy/conf.d" \
+            "/etc/fail2ban/filter.d" \
+            "/etc/fail2ban/jail.d" \
+            "/run/vanill-ia" \
+            "${OPT_DIR}"
+
+        if [[ ! -e "${OPT_DIR}/stacks" ]]; then
+            ln -s "${DATA_ROOT}/stacks" "${OPT_DIR}/stacks"
+        fi
+
+        if [[ ! -f "${AUTH_LOG}" ]]; then
+            touch "${AUTH_LOG}"
+        fi
+        chown www-data:adm "${AUTH_LOG}" 2>/dev/null || chown www-data:www-data "${AUTH_LOG}"
+        chmod 0640 "${AUTH_LOG}"
+
+        chown -R www-data:www-data "${DATA_ROOT}/data" "${DATA_ROOT}/notes" "${DATA_ROOT}/tmp" "${DATA_ROOT}/sessions"
+        chown -R root:www-data "${DATA_ROOT}/stacks" "${DATA_ROOT}/apps"
+        chmod 0750 "${DATA_ROOT}/data" "${DATA_ROOT}/notes" "${DATA_ROOT}/tmp"
+        chmod 0700 "${DATA_ROOT}/sessions"
+        chmod 0775 "${DATA_ROOT}/stacks" "${DATA_ROOT}/apps"
+
+        chown root:www-data "/run/vanill-ia"
+        chmod 0750 "/run/vanill-ia"
+
+        for bin in /usr/local/bin/vanill-ia-agent /usr/local/bin/vanill-ia-cron-run /usr/local/bin/vanill-ia-os /usr/local/bin/vanill-ia-browser-ctl; do
+            if [[ -f "${bin}" ]]; then
+                chmod 0755 "${bin}"
+            fi
+        done
+
+        # Dedicated unprivileged user for isolated remote browser sessions
+        id -u vanill-ia-browser >/dev/null 2>&1 || useradd -r -m -s /bin/false vanill-ia-browser
+
+        # 256-bit master key for at-rest secret encryption
+        if [[ ! -f "${SECRET_KEY_FILE}" ]]; then
+            php -r 'echo bin2hex(random_bytes(32));' > "${SECRET_KEY_FILE}"
+            chown www-data:www-data "${SECRET_KEY_FILE}"
+            chmod 0600 "${SECRET_KEY_FILE}"
+        fi
+
+        # Initialize / migrate SQLite database
+        SETUP_TOKEN_DISPLAY=""
+        if [[ -f "${SCHEMA_PATH}" ]]; then
+            echo "[Vanill-IA OS] Initializing / verifying SQLite schema..."
+            sqlite3 "${DB_PATH}" < "${SCHEMA_PATH}"
+            sqlite3 "${DB_PATH}" "ALTER TABLE users ADD COLUMN language TEXT NOT NULL DEFAULT 'en';" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "ALTER TABLE notifications ADD COLUMN user_id INTEGER DEFAULT NULL;" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "ALTER TABLE notifications ADD COLUMN action_url TEXT DEFAULT NULL;" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "ALTER TABLE notifications ADD COLUMN action_label TEXT DEFAULT NULL;" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "UPDATE users SET wallpaper = 'twilight' WHERE wallpaper LIKE '%twilight';" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "UPDATE desktop_shortcuts SET title = 'Files' WHERE app_id = 'file-station' AND title = 'File Station';" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "INSERT OR IGNORE INTO desktop_shortcuts (user_id, app_id, app_type, title, subtitle, icon, accent_color, open_mode, pinned_desktop, pinned_dock, sort_order) VALUES (NULL, 'mount-manager', 'system', 'Mount', 'SMB/CIFS Network Shares', 'harddrive', '#F97316', 'window', 1, 0, 35);" 2>/dev/null || true
+            sqlite3 "${DB_PATH}" "INSERT OR IGNORE INTO desktop_shortcuts (user_id, app_id, app_type, title, subtitle, icon, accent_color, open_mode, pinned_desktop, pinned_dock, sort_order) VALUES (NULL, 'web-browser', 'system', 'Web Browser', 'Isolated Remote Chromium', 'globe', '#3B82F6', 'window', 1, 1, 45);" 2>/dev/null || true
+
+            USER_COUNT="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM users;" 2>/dev/null || echo "0")"
+            if [[ "${USER_COUNT}" -eq 0 ]]; then
+                if [[ -f "${SETUP_TOKEN_FILE}" ]]; then
+                    SETUP_TOKEN_DISPLAY="$(tr -d '\r\n' < "${SETUP_TOKEN_FILE}")"
+                else
+                    SETUP_TOKEN_DISPLAY="$(php -r 'echo strtoupper(bin2hex(random_bytes(8)));')"
+                    TOKEN_HASH="$(SETUP_TOK="${SETUP_TOKEN_DISPLAY}" php -r '$a = defined("PASSWORD_ARGON2ID") ? PASSWORD_ARGON2ID : PASSWORD_DEFAULT; echo password_hash(getenv("SETUP_TOK"), $a);')"
+                    sqlite3 "${DB_PATH}" "INSERT INTO settings (key, value, category) VALUES ('security.setup_token_hash', '${TOKEN_HASH}', 'security') ON CONFLICT(key) DO UPDATE SET value = excluded.value;"
+                    echo "${SETUP_TOKEN_DISPLAY}" > "${SETUP_TOKEN_FILE}"
+                    chown root:root "${SETUP_TOKEN_FILE}"
+                    chmod 0600 "${SETUP_TOKEN_FILE}"
+                fi
+            else
+                sqlite3 "${DB_PATH}" "UPDATE settings SET value = '1' WHERE key = 'security.setup_completed';"
+                rm -f "${SETUP_TOKEN_FILE}"
+            fi
+
+            if [[ ! -f "${DATA_ROOT}/notes/Welcome.md" && ! -f "${DATA_ROOT}/notes/Bienvenue.md" ]]; then
+                cat > "${DATA_ROOT}/notes/Welcome.md" <<'EOF'
+# Welcome to Vanill-IA OS
+
+Your server is now managed through **Vanill-IA OS**.
+
+## Quick Overview
+- **Security**: Argon2id + TOTP 2FA (RFC 6238) + Fail2ban protection (`/var/log/vanill-ia-auth.log`).
+- **Docker & Stacks**: Manage containers and `docker-compose.yml` stacks transparently in `/opt/vanill-ia/stacks/`.
+- **AI Diagnostics**: Connect local **Ollama** or BYOK API keys (**Gemini 3.8 Flash**, OpenRouter, OpenAI, Anthropic) to diagnose logs in one click.
+EOF
+                chown www-data:www-data "${DATA_ROOT}/notes/Welcome.md"
+            fi
+
+            chown www-data:www-data "${DB_PATH}"
+            chmod 0660 "${DB_PATH}"
+            chown www-data:www-data "${DATA_ROOT}/data"
+        fi
+
+        # Enable & start the detected PHP-FPM service before resolving its Unix socket
+        PHP_FPM_SERVICE=""
+        if declare -F vanillia_detect_php_fpm_service >/dev/null 2>&1; then
+            PHP_FPM_SERVICE="$(vanillia_detect_php_fpm_service)"
+        fi
+
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl daemon-reload
+            if [[ -n "${PHP_FPM_SERVICE}" ]] && systemctl list-unit-files "${PHP_FPM_SERVICE}.service" >/dev/null 2>&1; then
+                systemctl enable --now "${PHP_FPM_SERVICE}.service" >/dev/null 2>&1 || true
+            else
+                while IFS= read -r fpm_unit_path; do
+                    if [[ -n "${fpm_unit_path}" ]]; then
+                        fpm_unit="$(basename "${fpm_unit_path}")"
+                        systemctl enable --now "${fpm_unit}" >/dev/null 2>&1 || true
+                        break
+                    fi
+                done < <(ls -1 /lib/systemd/system/php*-fpm.service /usr/lib/systemd/system/php*-fpm.service /lib/systemd/system/php-fpm.service /usr/lib/systemd/system/php-fpm.service 2>/dev/null | sort -Vr || true)
+            fi
+        fi
+
+        # Dynamically detect active PHP-FPM Unix socket (PHP 8.1 / 8.2 / 8.3 / 8.4+)
+        if declare -F vanillia_detect_php_fpm_socket >/dev/null 2>&1; then
+            PHP_FPM_SOCK="$(vanillia_detect_php_fpm_socket)"
+        else
+            PHP_VER="$(php -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;' 2>/dev/null || echo "")"
+            PHP_FPM_SOCK="${PHP_VER:+/run/php/php${PHP_VER}-fpm.sock}"
+            PHP_FPM_SOCK="${PHP_FPM_SOCK:-/run/php/php-fpm.sock}"
+        fi
+
+        ACTIVE_HTTP_PORT="8080"
+        if [[ -f "${CADDY_CONF}" ]]; then
+            sed -i -E "s|unix//run/php[^[:space:]]*\.sock|unix/${PHP_FPM_SOCK}|g" "${CADDY_CONF}"
+
+            if [[ -f "${CADDY_BROWSER_CONF}" ]] && ! grep -q "import vanill-ia-browser" "${CADDY_CONF}"; then
+                sed -i '/Service-Worker-Allowed/{n;s/}/}\n\n    import vanill-ia-browser/;}' "${CADDY_CONF}" || true
+            fi
+
+            DETECTED_PORT="$(php -r '
+                $c = @file_get_contents($argv[1]) ?: "";
+                if (preg_match_all("/^(?:http:\/\/)?(?:127\.0\.0\.1|localhost)?:([0-9]{2,5})\s*\{([\s\S]*?)^\}/m", $c, $m, PREG_SET_ORDER)) {
+                    foreach ($m as $blk) {
+                        if (!preg_match("/^\s*tls\s+/m", $blk[2])) {
+                            echo $blk[1];
+                            exit(0);
+                        }
+                    }
+                }
+                echo "8080";
+            ' "${CADDY_CONF}" 2>/dev/null || echo "8080")"
+
+            if [[ "${DETECTED_PORT}" =~ ^[0-9]{2,5}$ ]]; then
+                ACTIVE_HTTP_PORT="${DETECTED_PORT}"
+            fi
+        fi
+
+        if [[ -f "${CADDY_BROWSER_CONF}" ]]; then
+            sed -i -E "s|forward_auth[[:space:]]+127\.0\.0\.1:[0-9]+|forward_auth 127.0.0.1:${ACTIVE_HTTP_PORT}|g" "${CADDY_BROWSER_CONF}"
+        fi
+
+        # Configure Caddy if present (gracefully tolerated if installed later on minimal Ubuntu)
+        if [[ -d /etc/caddy ]]; then
+            if [[ -f "${CADDY_MAIN}" ]]; then
+                cp -a "${CADDY_MAIN}" "${CADDY_MAIN}.bak-vanill-ia"
+                sed -i -E 's|^([[:space:]]*import[[:space:]]+/etc/caddy/conf\.d/\*)[[:space:]]*$|\1.caddy|g' "${CADDY_MAIN}"
+                awk '
+                    /^[[:space:]]*import[[:space:]]+\/etc\/caddy\/conf\.d\/\*\.caddy([[:space:]]|$)/ {
+                        if (seen++) next
+                    }
+                    { print }
+                ' "${CADDY_MAIN}" > "${CADDY_MAIN}.tmp" && mv "${CADDY_MAIN}.tmp" "${CADDY_MAIN}"
+
+                if ! grep -qE '^[[:space:]]*import[[:space:]]+/etc/caddy/conf\.d/\*\.caddy([[:space:]]|$)' "${CADDY_MAIN}"; then
+                    printf "\n# Vanill-IA OS Managed Configurations\nimport /etc/caddy/conf.d/*.caddy\n" >> "${CADDY_MAIN}"
+                fi
+                chmod 0644 "${CADDY_MAIN}"
+            else
+                cat > "${CADDY_MAIN}" <<'EOF'
+# Global Caddyfile managed by Vanill-IA OS
+import /etc/caddy/conf.d/*.caddy
+EOF
+                chmod 0644 "${CADDY_MAIN}"
+            fi
+
+            if getent group caddy >/dev/null 2>&1; then
+                chown -R root:caddy /etc/caddy/conf.d
+                chmod 0755 /etc/caddy/conf.d
+            fi
+        fi
+
+        if [[ ! -f /etc/cron.d/vanill-ia ]]; then
+            cat > /etc/cron.d/vanill-ia <<'EOF'
+# /etc/cron.d/vanill-ia — Managed automatically by Vanill-IA OS
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+EOF
+            chown root:root /etc/cron.d/vanill-ia
+            chmod 0644 /etc/cron.d/vanill-ia
+        fi
+
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl daemon-reload
+            systemctl enable vanill-ia-agent.service
+            systemctl restart vanill-ia-agent.service
+
+            if command -v caddy >/dev/null 2>&1 && systemctl list-unit-files caddy.service >/dev/null 2>&1; then
+                systemctl enable caddy.service >/dev/null 2>&1 || true
+                systemctl reload-or-restart caddy.service >/dev/null 2>&1 || true
+            elif ! command -v caddy >/dev/null 2>&1; then
+                echo "[Vanill-IA OS] Note: Caddy is not installed yet. Run install.sh or install caddy to serve the WebOS over HTTPS."
+            fi
+
+            if systemctl is-active --quiet fail2ban.service 2>/dev/null; then
+                systemctl reload fail2ban.service >/dev/null 2>&1 || true
+            fi
+        fi
+
+        if [[ -n "${SETUP_TOKEN_DISPLAY}" ]]; then
+            echo ""
+            echo "=================================================================="
+            echo " [SECURITY] No default account was created."
+            echo " First-Boot Setup Token : ${SETUP_TOKEN_DISPLAY}"
+            echo " (Retrieve anytime via  : sudo vanill-ia-os setup-token)"
+            echo "=================================================================="
+        fi
+
+        echo "[Vanill-IA OS] Post-installation completed successfully."
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument: '${1:-}'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,15 @@
+Package: vanill-ia-os
+Version: 1.6.2
+Section: admin
+Priority: optional
+Architecture: all
+Maintainer: Vanill-IA Project <contact@vanill-ia.com>
+Homepage: https://vanill-ia.com
+Depends: php-fpm, php-cli, php-sqlite3, php-curl, php-mbstring, php-xml, php-zip, sqlite3, cron, sudo, curl, procps, iproute2, util-linux, smartmontools, lm-sensors, ufw
+Recommends: caddy, docker-ce | docker.io, docker-compose-plugin | docker-compose-v2 | docker-compose, fail2ban, samba, zip, unzip, acl, chromium | chromium-browser, tigervnc-standalone-server | tightvncserver, novnc, websockify | python3-websockify, openbox
+Suggests: cifs-utils
+Description: Vanill-IA OS - Self-Hosted WebOS & Native AI Server Platform
+ Lightweight, zero-bloat, open-source WebOS designed to administer Debian,
+ Ubuntu, and Raspberry Pi OS servers, Docker Compose stacks, Caddy reverse proxy
+ routes, scheduled Cron tasks, file shares, isolated remote browsing, and native
+ SysAdmin AI (Ollama and BYOK LLMs) as an installable Progressive Web App (PWA).

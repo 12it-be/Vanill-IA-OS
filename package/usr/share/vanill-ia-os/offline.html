@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0F1115">
+  <title>Vanill-IA OS — Reconnecting...</title>
+  <link rel="icon" type="image/png" href="/assets/img/pwa/favicon-32.png">
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0F1115;
+      --card: rgba(24, 28, 37, 0.78);
+      --border: rgba(255, 255, 255, 0.09);
+      --text: #F8FAFC;
+      --muted: #94A3B8;
+      --coral: #FF6D5A;
+      --emerald: #10B981;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100dvh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: calc(24px + env(safe-area-inset-top)) 20px calc(24px + env(safe-area-inset-bottom));
+      background:
+        radial-gradient(circle at 20% 15%, rgba(255, 109, 90, 0.14), transparent 45%),
+        radial-gradient(circle at 80% 85%, rgba(14, 165, 233, 0.12), transparent 45%),
+        var(--bg);
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: var(--text);
+    }
+    .card {
+      width: 100%;
+      max-width: 430px;
+      padding: 36px 32px;
+      border-radius: 24px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      box-shadow: 0 25px 60px rgba(0, 0, 0, 0.55);
+      text-align: center;
+    }
+    .logo-wrap {
+      width: 76px;
+      height: 76px;
+      margin: 0 auto 22px;
+    }
+    .logo-wrap svg {
+      width: 100%;
+      height: 100%;
+      filter: drop-shadow(0 10px 24px rgba(255, 109, 90, 0.25));
+      animation: pulseLogo 2.4s ease-in-out infinite;
+    }
+    @keyframes pulseLogo {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(0.95); opacity: 0.84; }
+    }
+    h1 { font-size: 1.35rem; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 10px; }
+    p { font-size: 0.92rem; line-height: 1.55; color: var(--muted); margin-bottom: 24px; }
+    .status-pill {
+      display: inline-flex; align-items: center; gap: 10px; padding: 8px 16px;
+      border-radius: 999px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--border);
+      font-size: 0.82rem; color: var(--text); margin-bottom: 24px;
+    }
+    .dot {
+      width: 9px; height: 9px; border-radius: 50%; background: var(--coral);
+      box-shadow: 0 0 12px var(--coral); animation: blink 1.2s infinite;
+    }
+    .dot.online { background: var(--emerald); box-shadow: 0 0 12px var(--emerald); animation: none; }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    .btn {
+      width: 100%; padding: 12px 18px; border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.12); background: rgba(255, 255, 255, 0.07);
+      color: var(--text); font-size: 0.9rem; font-weight: 600; cursor: pointer;
+    }
+    .btn:hover { background: rgba(255, 255, 255, 0.13); }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="logo-wrap">
+      <svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect width="512" height="512" rx="116" fill="#0F1115"/>
+        <rect x="4" y="4" width="504" height="504" rx="112" stroke="#FFFFFF" stroke-opacity="0.12" stroke-width="8"/>
+        <polygon points="96,120 180,120 194,298" fill="#FFFFFF"/>
+        <polygon points="256,120 206,268 306,268" fill="#FFFFFF"/>
+        <polygon points="416,120 332,120 318,298" fill="#FFFFFF"/>
+        <polygon points="204,316 308,316 256,412" fill="#FF6D5A"/>
+      </svg>
+    </div>
+
+    <h1 id="offTitle">Connection to Vanill-IA OS Lost</h1>
+    <p id="offDesc">The Debian server is rebooting or temporarily unreachable. Your desktop will reload automatically as soon as it is back online.</p>
+
+    <div class="status-pill">
+      <span class="dot" id="statusDot"></span>
+      <span id="statusLabel">Reconnection attempt #1...</span>
+    </div>
+
+    <button type="button" class="btn" id="retryBtn">Test connection now</button>
+  </main>
+
+  <script>
+    const isFr = (localStorage.getItem('vanillia_lang') || 'en') === 'fr';
+    if (isFr) {
+      document.documentElement.lang = 'fr';
+      document.getElementById('offTitle').textContent = 'Connexion à Vanill-IA OS interrompue';
+      document.getElementById('offDesc').textContent = 'Le serveur Debian est en cours de redémarrage ou temporairement injoignable. Le bureau se rechargera automatiquement dès son retour en ligne.';
+      document.getElementById('retryBtn').textContent = 'Tester la connexion maintenant';
+    }
+
+    let attempts = 0;
+    const label = document.getElementById('statusLabel');
+    const dot = document.getElementById('statusDot');
+    const btn = document.getElementById('retryBtn');
+
+    async function probeServer() {
+      attempts += 1;
+      label.textContent = isFr ? `Tentative de reconnexion #${attempts}...` : `Reconnection attempt #${attempts}...`;
+      try {
+        const res = await fetch('/api/auth.php?action=ping', {
+          method: 'GET',
+          cache: 'no-store',
+          headers: { 'Accept': 'application/json' }
+        });
+        if (res.ok) {
+          dot.classList.add('online');
+          label.textContent = isFr ? 'Serveur en ligne ! Ouverture du bureau...' : 'Server online! Opening desktop...';
+          setTimeout(() => window.location.replace('/'), 350);
+        }
+      } catch (_) {}
+    }
+
+    btn.addEventListener('click', probeServer);
+    setInterval(probeServer, 3000);
+    setTimeout(probeServer, 1200);
+  </script>
+</body>
+</html>

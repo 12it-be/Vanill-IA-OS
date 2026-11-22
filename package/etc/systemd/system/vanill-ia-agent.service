@@ -1,0 +1,26 @@
+[Unit]
+Description=Vanill-IA OS Privileged System Daemon
+Documentation=https://gitea.jn-dev.be/JN/Vanill-IA-OS
+After=network.target local-fs.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=www-data
+RuntimeDirectory=vanill-ia
+RuntimeDirectoryMode=0750
+UMask=0007
+WorkingDirectory=/usr/share/vanill-ia-os
+ExecStart=/usr/bin/php -d memory_limit=256M -d max_execution_time=0 /usr/local/bin/vanill-ia-agent
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=vanill-ia-agent
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

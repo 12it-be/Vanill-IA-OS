@@ -1,0 +1,13 @@
+# ==============================================================================
+# Fail2ban Jail for Vanill-IA OS WebOS Login / 2FA / Setup Protection
+# ==============================================================================
+
+[vanill-ia-os]
+enabled  = true
+port     = 8443,8080,http,https
+filter   = vanill-ia-os
+logpath  = /var/log/vanill-ia-auth.log
+maxretry = 5
+findtime = 15m
+bantime  = 1h
+backend  = auto

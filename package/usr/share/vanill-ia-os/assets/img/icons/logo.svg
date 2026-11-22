@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <rect width="512" height="512" rx="116" fill="#0F1115"/>
+  <rect x="4" y="4" width="504" height="504" rx="112" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="8"/>
+  <!-- 3 Top White Triangles (#FFFFFF) forming V + A -->
+  <polygon points="96,120 180,120 194,298" fill="#FFFFFF"/>
+  <polygon points="256,120 206,268 306,268" fill="#FFFFFF"/>
+  <polygon points="416,120 332,120 318,298" fill="#FFFFFF"/>
+  <!-- 1 Bottom Coral Point (#FF6D5A) -->
+  <polygon points="204,316 308,316 256,412" fill="#FF6D5A"/>
+</svg>

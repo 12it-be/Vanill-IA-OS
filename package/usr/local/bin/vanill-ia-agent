@@ -1,0 +1,3396 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * ==============================================================================
+ * Vanill-IA OS — Privileged System Daemon (vanill-ia-agent)
+ * ==============================================================================
+ * Runs as root via systemd, listens exclusively on /run/vanill-ia/agent.sock
+ * (permissions 0660, owner root:www-data).
+ * Exposes a strict allowlist of Debian, Docker, Caddy, Storage, UFW & Cron
+ * operations over newline-delimited JSON (NDJSON).
+ * ==============================================================================
+ */
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "[FATAL] vanill-ia-agent doit être exécuté via PHP CLI.\n");
+    exit(1);
+}
+
+error_reporting(E_ALL);
+ini_set('display_errors', '0');
+ini_set('log_errors', '1');
+
+final class AgentError extends RuntimeException
+{
+    public function __construct(
+        public readonly string $errorCode,
+        string $message,
+        int $code = 400,
+        ?Throwable $previous = null
+    ) {
+        parent::__construct($message, $code, $previous);
+    }
+}
+
+final class VanillIAAgent
+{
+    public const VERSION = '1.6.2';
+    private const SOCKET_DIR = '/run/vanill-ia';
+    private const SOCKET_PATH = '/run/vanill-ia/agent.sock';
+    private const DOCKER_SOCKET = '/var/run/docker.sock';
+    private const DB_PATH = '/var/lib/vanill-ia-os/data/vanill-ia.db';
+    private const STACKS_DIR = '/var/lib/vanill-ia-os/stacks';
+    private const CADDY_CONF_DIR = '/etc/caddy/conf.d';
+    private const CRON_FILE = '/etc/cron.d/vanill-ia';
+    private const SAMBA_SHARES_FILE = '/etc/samba/vanill-ia-shares.conf';
+    private const MAX_PAYLOAD_BYTES = 2_097_152; // 2 Mo max par requête
+    private const CLIENT_IDLE_TIMEOUT = 30;
+
+    private bool $running = true;
+    private int $startedAt;
+
+    /** @var resource|null */
+    private $server = null;
+
+    /** @var array<int, resource> */
+    private array $clients = [];
+
+    /** @var array<int, string> */
+    private array $readBuffers = [];
+
+    /** @var array<int, int> */
+    private array $lastActivity = [];
+
+    /** Snapshots en mémoire pour le calcul temps réel des deltas CPU et Réseau */
+    /** @var array<string, array{total: int, idle: int}> */
+    private array $prevCpuSnap = [];
+
+    /** @var array{ts_ns: int, ifaces: array<string, array{rx: int, tx: int}>}|null */
+    private ?array $prevNetSnap = null;
+
+    public function __construct()
+    {
+        $this->startedAt = time();
+        $this->registerSignals();
+        // Initialisation du premier snapshot CPU/Net pour éviter un premier delta à zéro
+        $this->sampleCpuUsage();
+        $this->sampleNetworkUsage();
+    }
+
+    private function registerSignals(): void
+    {
+        if (function_exists('pcntl_async_signals')) {
+            pcntl_async_signals(true);
+            pcntl_signal(SIGTERM, fn () => $this->shutdown('SIGTERM'));
+            pcntl_signal(SIGINT, fn () => $this->shutdown('SIGINT'));
+            pcntl_signal(SIGHUP, function (): void {
+                $this->log('INFO', 'SIGHUP reçu : rechargement des caches internes.');
+            });
+        }
+    }
+
+    private function shutdown(string $signal): void
+    {
+        $this->log('INFO', "Signal {$signal} reçu, arrêt propre du daemon...");
+        $this->running = false;
+    }
+
+    private function log(string $level, string $message): void
+    {
+        fwrite(STDERR, sprintf("[%s] [%s] %s\n", gmdate('Y-m-d\TH:i:s\Z'), $level, $message));
+    }
+
+    public function run(): void
+    {
+        if (!is_dir(self::SOCKET_DIR) && !mkdir(self::SOCKET_DIR, 0750, true) && !is_dir(self::SOCKET_DIR)) {
+            throw new RuntimeException('Impossible de créer ' . self::SOCKET_DIR);
+        }
+        @chown(self::SOCKET_DIR, 'root');
+        @chgrp(self::SOCKET_DIR, 'www-data');
+        @chmod(self::SOCKET_DIR, 0750);
+
+        if (file_exists(self::SOCKET_PATH)) {
+            @unlink(self::SOCKET_PATH);
+        }
+
+        $errno = 0;
+        $errstr = '';
+        $server = @stream_socket_server('unix://' . self::SOCKET_PATH, $errno, $errstr);
+        if ($server === false) {
+            throw new RuntimeException("Impossible d'ouvrir le socket Unix " . self::SOCKET_PATH . " : [{$errno}] {$errstr}");
+        }
+
+        @chown(self::SOCKET_PATH, 'root');
+        @chgrp(self::SOCKET_PATH, 'www-data');
+        @chmod(self::SOCKET_PATH, 0660);
+        stream_set_blocking($server, false);
+
+        $this->server = $server;
+        $this->log('INFO', sprintf('Vanill-IA Agent v%s prêt sur %s (0660 root:www-data)', self::VERSION, self::SOCKET_PATH));
+
+        try {
+            while ($this->running) {
+                $read = [$this->server];
+                foreach ($this->clients as $client) {
+                    $read[] = $client;
+                }
+                $write = null;
+                $except = null;
+
+                $ready = @stream_select($read, $write, $except, 1, 0);
+                if ($ready === false) {
+                    // Interruption normale par un signal POSIX
+                    continue;
+                }
+
+                if ($ready > 0) {
+                    if (in_array($this->server, $read, true)) {
+                        $conn = @stream_socket_accept($this->server, 0);
+                        if ($conn !== false) {
+                            stream_set_blocking($conn, false);
+                            $id = (int) $conn;
+                            $this->clients[$id] = $conn;
+                            $this->readBuffers[$id] = '';
+                            $this->lastActivity[$id] = time();
+                        }
+                        $idx = array_search($this->server, $read, true);
+                        if ($idx !== false) {
+                            unset($read[$idx]);
+                        }
+                    }
+
+                    foreach ($read as $conn) {
+                        $this->handleClientRead($conn);
+                    }
+                }
+
+                $this->pruneIdleClients();
+            }
+        } finally {
+            foreach ($this->clients as $conn) {
+                @fclose($conn);
+            }
+            if (is_resource($this->server)) {
+                @fclose($this->server);
+            }
+            if (file_exists(self::SOCKET_PATH)) {
+                @unlink(self::SOCKET_PATH);
+            }
+            $this->log('INFO', 'Daemon arrêté proprement.');
+        }
+    }
+
+    /**
+     * @param resource $conn
+     */
+    private function handleClientRead($conn): void
+    {
+        $id = (int) $conn;
+        $chunk = @fread($conn, 65536);
+
+        if ($chunk === '' || $chunk === false) {
+            if (feof($conn)) {
+                $this->closeClient($id);
+            }
+            return;
+        }
+
+        $this->lastActivity[$id] = time();
+        $this->readBuffers[$id] .= $chunk;
+
+        if (strlen($this->readBuffers[$id]) > self::MAX_PAYLOAD_BYTES) {
+            $this->writeJson($conn, [
+                'ok'    => false,
+                'error' => [
+                    'code'    => 'PAYLOAD_TOO_LARGE',
+                    'message' => 'La requête dépasse la taille maximale autorisée (2 Mo).',
+                ],
+            ]);
+            $this->closeClient($id);
+            return;
+        }
+
+        while (($newlinePos = strpos($this->readBuffers[$id], "\n")) !== false) {
+            $rawLine = substr($this->readBuffers[$id], 0, $newlinePos);
+            $this->readBuffers[$id] = substr($this->readBuffers[$id], $newlinePos + 1);
+
+            $rawLine = trim($rawLine);
+            if ($rawLine === '') {
+                continue;
+            }
+
+            $response = $this->processRequestLine($rawLine);
+            $this->writeJson($conn, $response);
+        }
+    }
+
+    /**
+     * @param resource $conn
+     * @param array<string, mixed> $payload
+     */
+    private function writeJson($conn, array $payload): void
+    {
+        $encoded = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        if ($encoded === false) {
+            $encoded = '{"ok":false,"error":{"code":"ENCODING_ERROR","message":"Erreur interne d\'encodage JSON."}}';
+        }
+        $encoded .= "\n";
+
+        stream_set_blocking($conn, true);
+        $total = strlen($encoded);
+        $written = 0;
+        while ($written < $total) {
+            $n = @fwrite($conn, substr($encoded, $written));
+            if ($n === false || $n === 0) {
+                break;
+            }
+            $written += $n;
+        }
+        stream_set_blocking($conn, false);
+    }
+
+    private function closeClient(int $id): void
+    {
+        if (isset($this->clients[$id])) {
+            @fclose($this->clients[$id]);
+            unset($this->clients[$id], $this->readBuffers[$id], $this->lastActivity[$id]);
+        }
+    }
+
+    private function pruneIdleClients(): void
+    {
+        $now = time();
+        foreach ($this->lastActivity as $id => $lastTs) {
+            if (($now - $lastTs) > self::CLIENT_IDLE_TIMEOUT) {
+                $this->closeClient($id);
+            }
+        }
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function processRequestLine(string $rawLine): array
+    {
+        $startNs = hrtime(true);
+        $reqId = null;
+        $action = 'unknown';
+
+        try {
+            $decoded = json_decode($rawLine, true, 64, JSON_THROW_ON_ERROR);
+            if (!is_array($decoded)) {
+                throw new AgentError('INVALID_JSON', 'Objet JSON attendu.');
+            }
+
+            $reqId = isset($decoded['id']) && is_scalar($decoded['id']) ? (string) $decoded['id'] : null;
+            $action = isset($decoded['action']) && is_string($decoded['action']) ? trim($decoded['action']) : '';
+            $params = isset($decoded['params']) && is_array($decoded['params']) ? $decoded['params'] : [];
+
+            if ($action === '' || preg_match('/^[a-z0-9_.-]{3,64}$/', $action) !== 1) {
+                throw new AgentError('INVALID_ACTION', 'Nom d\'action invalide ou manquant.');
+            }
+
+            $data = $this->dispatch($action, $params);
+            $durationMs = round((hrtime(true) - $startNs) / 1_000_000, 2);
+
+            return [
+                'id'     => $reqId,
+                'ok'     => true,
+                'action' => $action,
+                'data'   => $data,
+                'meta'   => [
+                    'duration_ms' => $durationMs,
+                    'timestamp'   => time(),
+                ],
+            ];
+        } catch (JsonException $e) {
+            return [
+                'id'     => $reqId,
+                'ok'     => false,
+                'action' => $action,
+                'error'  => [
+                    'code'    => 'JSON_PARSE_ERROR',
+                    'message' => 'JSON malformé : ' . $e->getMessage(),
+                ],
+            ];
+        } catch (AgentError $e) {
+            $durationMs = round((hrtime(true) - $startNs) / 1_000_000, 2);
+            return [
+                'id'     => $reqId,
+                'ok'     => false,
+                'action' => $action,
+                'error'  => [
+                    'code'        => $e->errorCode,
+                    'message'     => $e->getMessage(),
+                    'http_status' => $e->getCode(),
+                ],
+                'meta'   => [
+                    'duration_ms' => $durationMs,
+                    'timestamp'   => time(),
+                ],
+            ];
+        } catch (Throwable $e) {
+            $this->log('ERROR', sprintf('Exception sur [%s] : %s (%s:%d)', $action, $e->getMessage(), $e->getFile(), $e->getLine()));
+            return [
+                'id'     => $reqId,
+                'ok'     => false,
+                'action' => $action,
+                'error'  => [
+                    'code'        => 'INTERNAL_ERROR',
+                    'message'     => $e->getMessage(),
+                    'http_status' => 500,
+                ],
+            ];
+        }
+    }
+
+    /**
+     * Routeur à liste blanche stricte (Allowlist)
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function dispatch(string $action, array $params): array
+    {
+        return match ($action) {
+            // Core
+            'agent.ping'               => $this->handlePing(),
+
+            // Système & Monitoring Matériel
+            'system.info'              => $this->handleSystemInfo(),
+            'system.metrics'           => $this->handleSystemMetrics(),
+            'system.smart'             => $this->handleSystemSmart(),
+            'system.power'             => $this->handleSystemPower($params),
+
+            // Stockage, Partages Samba & Montage Client CIFS (Mount App)
+            'storage.lsblk'            => $this->handleStorageLsblk(),
+            'storage.mount'            => $this->handleStorageMount($params),
+            'storage.umount'           => $this->handleStorageUmount($params),
+            'storage.samba.list'       => $this->handleSambaList(),
+            'storage.samba.save'       => $this->handleSambaSave($params),
+            'cifs.status'              => $this->handleCifsStatus(),
+            'cifs.mount'               => $this->handleCifsMount($params),
+            'cifs.umount'              => $this->handleCifsUmount($params),
+
+            // Réseau & Sécurité (UFW, Fail2ban, Tailscale)
+            'network.interfaces'       => $this->handleNetworkInterfaces(),
+            'security.ufw.status'      => $this->handleUfwStatus(),
+            'security.ufw.rule'        => $this->handleUfwRule($params),
+            'security.ufw.toggle'      => $this->handleUfwToggle($params),
+            'security.fail2ban.status' => $this->handleFail2banStatus(),
+            'security.fail2ban.unban'  => $this->handleFail2banUnban($params),
+            'security.tailscale.status'=> $this->handleTailscaleStatus(),
+            'security.tailscale.action'=> $this->handleTailscaleAction($params),
+
+            // Services Systemd & Mises à jour APT
+            'service.list'             => $this->handleServiceList($params),
+            'service.action'           => $this->handleServiceAction($params),
+            'service.logs'             => $this->handleServiceLogs($params),
+            'apt.status'               => $this->handleAptStatus($params),
+            'apt.upgrade'              => $this->handleAptUpgrade(),
+
+            // Docker Engine, Compose Stacks & Reverse Proxy Caddy
+            'docker.info'              => $this->handleDockerInfo(),
+            'docker.containers'        => $this->handleDockerContainers($params),
+            'docker.stats'             => $this->handleDockerStats(),
+            'docker.container.action'  => $this->handleDockerContainerAction($params),
+            'docker.container.logs'    => $this->handleDockerContainerLogs($params),
+            'docker.container.exec'    => $this->handleDockerContainerExec($params),
+            'docker.stacks.list'       => $this->handleDockerStacksList(),
+            'docker.stacks.get'        => $this->handleDockerStackGet($params),
+            'docker.stacks.save'       => $this->handleDockerStackSave($params),
+            'docker.stacks.action'     => $this->handleDockerStackAction($params),
+            'caddy.proxy.list'         => $this->handleCaddyProxyList(),
+            'caddy.proxy.save'         => $this->handleCaddyProxySave($params),
+            'caddy.proxy.delete'       => $this->handleCaddyProxyDelete($params),
+            'caddy.exposure.save'      => $this->handleCaddyExposureSave($params),
+
+            // Planificateur Cron
+            'cron.sync'                => $this->handleCronSync(),
+            'cron.run'                 => $this->handleCronRun($params),
+            'cron.users'               => $this->handleSystemUsersList(),
+
+            // Permissions & Opérations Fichiers (File Station & Terminal)
+            'fs.chmod'                 => $this->handleFsChmod($params),
+            'fs.chown'                 => $this->handleFsChown($params),
+            'fs.list'                  => $this->handleFsList($params),
+            'fs.read'                  => $this->handleFsRead($params),
+            'fs.write'                 => $this->handleFsWrite($params),
+            'fs.mkdir'                 => $this->handleFsMkdir($params),
+            'fs.rename'                => $this->handleFsRename($params),
+            'fs.delete'                => $this->handleFsDelete($params),
+            'fs.archive'               => $this->handleFsArchive($params),
+            'fs.stat_share'            => $this->handleFsStatShare($params),
+            'fs.read_chunk'            => $this->handleFsReadChunk($params),
+            'shell.exec'               => $this->handleShellExec($params),
+
+            // Navigateur Web Isolé (Remote Browser Isolation — 0 Mo RAM au repos)
+            'browser_start', 'browser.start'   => $this->handleBrowserControl('start', $params),
+            'browser_stop', 'browser.stop'     => $this->handleBrowserControl('stop', $params),
+            'browser_status', 'browser.status' => $this->handleBrowserControl('status', $params),
+
+            default => throw new AgentError('UNKNOWN_ACTION', "Action non autorisée : {$action}", 404),
+        };
+    }
+
+    // ==========================================================================
+    // HELPERS D'EXÉCUTION SÉCURISÉE & BASE DE DONNÉES
+    // ==========================================================================
+
+    /**
+     * @param list<string> $cmd
+     * @param array<string, string> $env
+     * @return array{exit_code: int, stdout: string, stderr: string}
+     */
+    private function runCommand(array $cmd, ?string $cwd = null, int $timeoutSec = 30, array $env = []): array
+    {
+        $descriptors = [
+            0 => ['pipe', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ];
+
+        $mergedEnv = array_merge([
+            'PATH'   => '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+            'LANG'   => 'C.UTF-8',
+            'LC_ALL' => 'C.UTF-8',
+            'HOME'   => '/root',
+        ], $env);
+
+        $process = @proc_open($cmd, $descriptors, $pipes, $cwd, $mergedEnv);
+        if (!is_resource($process)) {
+            throw new AgentError('EXEC_FAILED', 'Impossible de lancer le processus : ' . ($cmd[0] ?? 'unknown'), 500);
+        }
+
+        fclose($pipes[0]);
+        stream_set_blocking($pipes[1], false);
+        stream_set_blocking($pipes[2], false);
+
+        $stdout = '';
+        $stderr = '';
+        $deadline = microtime(true) + $timeoutSec;
+        $maxCapture = 1_048_576; // 1 Mo max
+
+        while (true) {
+            $read = [];
+            if (!feof($pipes[1])) {
+                $read[] = $pipes[1];
+            }
+            if (!feof($pipes[2])) {
+                $read[] = $pipes[2];
+            }
+            if ($read === []) {
+                break;
+            }
+
+            $remaining = $deadline - microtime(true);
+            if ($remaining <= 0) {
+                proc_terminate($process, 9);
+                fclose($pipes[1]);
+                fclose($pipes[2]);
+                proc_close($process);
+                throw new AgentError('COMMAND_TIMEOUT', sprintf('Délai dépassé (%ds) pour %s', $timeoutSec, $cmd[0]), 504);
+            }
+
+            $sec = (int) floor($remaining);
+            $usec = (int) (($remaining - $sec) * 1_000_000);
+            $write = null;
+            $except = null;
+
+            if (@stream_select($read, $write, $except, min(1, $sec), $sec >= 1 ? 0 : $usec) > 0) {
+                foreach ($read as $stream) {
+                    $chunk = fread($stream, 16384);
+                    if ($chunk === false || $chunk === '') {
+                        continue;
+                    }
+                    if ($stream === $pipes[1] && strlen($stdout) < $maxCapture) {
+                        $stdout .= substr($chunk, 0, $maxCapture - strlen($stdout));
+                    } elseif ($stream === $pipes[2] && strlen($stderr) < $maxCapture) {
+                        $stderr .= substr($chunk, 0, $maxCapture - strlen($stderr));
+                    }
+                }
+            }
+        }
+
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exitCode = proc_close($process);
+
+        return [
+            'exit_code' => $exitCode,
+            'stdout'    => $stdout,
+            'stderr'    => $stderr,
+        ];
+    }
+
+    private function openDatabase(): PDO
+    {
+        if (!is_file(self::DB_PATH)) {
+            throw new AgentError('DB_NOT_FOUND', 'Base SQLite introuvable : ' . self::DB_PATH, 500);
+        }
+        $pdo = new PDO('sqlite:' . self::DB_PATH, null, null, [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_TIMEOUT            => 5,
+        ]);
+        $pdo->exec('PRAGMA journal_mode = WAL;');
+        $pdo->exec('PRAGMA busy_timeout = 5000;');
+        return $pdo;
+    }
+
+    private function commandExists(string $binary): bool
+    {
+        foreach (['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin'] as $dir) {
+            if (is_executable($dir . '/' . $binary)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ==========================================================================
+    // 1. AGENT & MONITORING MATÉRIEL TEMPS RÉEL
+    // ==========================================================================
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handlePing(): array
+    {
+        return [
+            'status'         => 'online',
+            'agent_version'  => self::VERSION,
+            'php_version'    => PHP_VERSION,
+            'daemon_uptime'  => time() - $this->startedAt,
+            'docker_socket'  => file_exists(self::DOCKER_SOCKET),
+            'active_clients' => count($this->clients),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleSystemInfo(): array
+    {
+        $osPretty = 'Debian GNU/Linux';
+        $osVersionId = '';
+        if (is_readable('/etc/os-release')) {
+            $osData = parse_ini_file('/etc/os-release') ?: [];
+            $osPretty = (string) ($osData['PRETTY_NAME'] ?? $osPretty);
+            $osVersionId = (string) ($osData['VERSION_ID'] ?? '');
+        }
+
+        $cpuModel = 'Processeur inconnu';
+        $cpuCores = 1;
+        if (is_readable('/proc/cpuinfo')) {
+            $cpuInfo = (string) file_get_contents('/proc/cpuinfo');
+            if (preg_match('/^model name\s*:\s*(.+)$/m', $cpuInfo, $m)) {
+                $cpuModel = trim($m[1]);
+            } elseif (preg_match('/^Model\s*:\s*(.+)$/m', $cpuInfo, $m)) {
+                $cpuModel = trim($m[1]);
+            }
+            $cpuCores = max(1, preg_match_all('/^processor\s*:/m', $cpuInfo));
+        }
+
+        $uptimeSec = 0;
+        if (is_readable('/proc/uptime')) {
+            $parts = explode(' ', trim((string) file_get_contents('/proc/uptime')));
+            $uptimeSec = (int) floor((float) ($parts[0] ?? 0));
+        }
+
+        $memInfo = $this->parseMeminfo();
+
+        $ips = [];
+        if ($this->commandExists('hostname')) {
+            $res = $this->runCommand(['hostname', '-I'], null, 5);
+            if ($res['exit_code'] === 0) {
+                $ips = array_values(array_filter(explode(' ', trim($res['stdout']))));
+            }
+        }
+
+        $caddyVersion = null;
+        if ($this->commandExists('caddy')) {
+            $res = $this->runCommand(['caddy', 'version'], null, 5);
+            if ($res['exit_code'] === 0) {
+                $caddyVersion = trim(explode(' ', trim($res['stdout']))[0]);
+            }
+        }
+
+        return [
+            'hostname'        => gethostname() ?: 'debian',
+            'os_name'         => $osPretty,
+            'os_version_id'   => $osVersionId,
+            'kernel'          => php_uname('r'),
+            'arch'            => php_uname('m'),
+            'cpu_model'       => $cpuModel,
+            'cpu_cores'       => $cpuCores,
+            'memory_total'    => $memInfo['total'],
+            'uptime_sec'      => $uptimeSec,
+            'ip_addresses'    => $ips,
+            'php_version'     => PHP_VERSION,
+            'php_fpm_service' => $this->detectPhpFpmService(),
+            'php_fpm_socket'  => $this->detectPhpFpmSocket(),
+            'caddy_version'   => $caddyVersion,
+            'docker_ready'    => file_exists(self::DOCKER_SOCKET),
+            'agent_version'   => self::VERSION,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleSystemMetrics(): array
+    {
+        $cpu = $this->sampleCpuUsage();
+        $mem = $this->parseMeminfo();
+        $net = $this->sampleNetworkUsage();
+
+        $loadAvg = sys_getloadavg() ?: [0.0, 0.0, 0.0];
+        $processesTotal = 0;
+        if (is_readable('/proc/loadavg')) {
+            $parts = explode(' ', trim((string) file_get_contents('/proc/loadavg')));
+            if (isset($parts[3]) && str_contains($parts[3], '/')) {
+                [, $processesTotal] = array_map('intval', explode('/', $parts[3], 2));
+            }
+        }
+
+        return [
+            'cpu'          => $cpu,
+            'memory'       => $mem,
+            'load_average' => [
+                '1m'        => round((float) $loadAvg[0], 2),
+                '5m'        => round((float) $loadAvg[1], 2),
+                '15m'       => round((float) $loadAvg[2], 2),
+                'processes' => $processesTotal,
+            ],
+            'network'      => $net,
+            'disks'        => $this->getMountedFilesystemsUsage(),
+            'temperatures' => $this->readTemperatures(),
+        ];
+    }
+
+    /**
+     * Calcul exact de la charge CPU globale et par cœur via delta /proc/stat
+     *
+     * @return array{total_percent: float, cores: array<string, float>}
+     */
+    private function sampleCpuUsage(): array
+    {
+        if (!is_readable('/proc/stat')) {
+            return ['total_percent' => 0.0, 'cores' => []];
+        }
+
+        $lines = file('/proc/stat', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+        $currentSnap = [];
+        $totalPercent = 0.0;
+        $cores = [];
+
+        foreach ($lines as $line) {
+            if (!preg_match('/^(cpu\d*)\s+(.+)$/', $line, $m)) {
+                continue;
+            }
+            $label = $m[1];
+            $cols = array_map('intval', preg_split('/\s+/', trim($m[2])) ?: []);
+            // user(0), nice(1), system(2), idle(3), iowait(4), irq(5), softirq(6), steal(7)
+            $idle = ($cols[3] ?? 0) + ($cols[4] ?? 0);
+            $total = 0;
+            for ($i = 0; $i <= 7; $i++) {
+                $total += $cols[$i] ?? 0;
+            }
+
+            $currentSnap[$label] = ['total' => $total, 'idle' => $idle];
+
+            $prev = $this->prevCpuSnap[$label] ?? null;
+            $percent = 0.0;
+            if ($prev !== null) {
+                $deltaTotal = $total - $prev['total'];
+                $deltaIdle = $idle - $prev['idle'];
+                if ($deltaTotal > 0) {
+                    $percent = round(max(0.0, min(100.0, (1.0 - ($deltaIdle / $deltaTotal)) * 100.0)), 1);
+                }
+            }
+
+            if ($label === 'cpu') {
+                $totalPercent = $percent;
+            } else {
+                $cores[$label] = $percent;
+            }
+        }
+
+        $this->prevCpuSnap = $currentSnap;
+
+        return [
+            'total_percent' => $totalPercent,
+            'cores'         => $cores,
+        ];
+    }
+
+    /**
+     * @return array<string, int|float>
+     */
+    private function parseMeminfo(): array
+    {
+        $raw = [];
+        if (is_readable('/proc/meminfo')) {
+            $lines = file('/proc/meminfo', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+            foreach ($lines as $line) {
+                if (preg_match('/^([A-Za-z0-9_()]+):\s+(\d+)\s*kB/', $line, $m)) {
+                    $raw[$m[1]] = ((int) $m[2]) * 1024;
+                }
+            }
+        }
+
+        $total = $raw['MemTotal'] ?? 0;
+        $available = $raw['MemAvailable'] ?? ($raw['MemFree'] ?? 0);
+        $used = max(0, $total - $available);
+        $cached = ($raw['Cached'] ?? 0) + ($raw['SReclaimable'] ?? 0);
+        $buffers = $raw['Buffers'] ?? 0;
+
+        $swapTotal = $raw['SwapTotal'] ?? 0;
+        $swapFree = $raw['SwapFree'] ?? 0;
+        $swapUsed = max(0, $swapTotal - $swapFree);
+
+        return [
+            'total'        => $total,
+            'used'         => $used,
+            'available'    => $available,
+            'cached'       => $cached,
+            'buffers'      => $buffers,
+            'used_percent' => $total > 0 ? round(($used / $total) * 100, 1) : 0.0,
+            'swap_total'   => $swapTotal,
+            'swap_used'    => $swapUsed,
+            'swap_percent' => $swapTotal > 0 ? round(($swapUsed / $swapTotal) * 100, 1) : 0.0,
+        ];
+    }
+
+    /**
+     * @return array{rx_rate_bps: int, tx_rate_bps: int, interfaces: array<string, array<string, int>>}
+     */
+    private function sampleNetworkUsage(): array
+    {
+        $nowNs = hrtime(true);
+        $ifaces = [];
+
+        if (is_readable('/proc/net/dev')) {
+            $lines = file('/proc/net/dev', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+            foreach ($lines as $idx => $line) {
+                if ($idx < 2 || !str_contains($line, ':')) {
+                    continue;
+                }
+                [$name, $rest] = explode(':', $line, 2);
+                $name = trim($name);
+                if ($name === 'lo' || str_starts_with($name, 'veth') || str_starts_with($name, 'br-') || $name === 'docker0') {
+                    continue;
+                }
+                $cols = preg_split('/\s+/', trim($rest)) ?: [];
+                $ifaces[$name] = [
+                    'rx' => (int) ($cols[0] ?? 0),
+                    'tx' => (int) ($cols[8] ?? 0),
+                ];
+            }
+        }
+
+        $totalRxRate = 0;
+        $totalTxRate = 0;
+        $outIfaces = [];
+
+        $elapsedSec = $this->prevNetSnap !== null
+            ? max(0.001, ($nowNs - $this->prevNetSnap['ts_ns']) / 1_000_000_000)
+            : 0.0;
+
+        foreach ($ifaces as $name => $counters) {
+            $rxRate = 0;
+            $txRate = 0;
+            if ($this->prevNetSnap !== null && isset($this->prevNetSnap['ifaces'][$name]) && $elapsedSec > 0) {
+                $prev = $this->prevNetSnap['ifaces'][$name];
+                $rxRate = max(0, (int) round(($counters['rx'] - $prev['rx']) / $elapsedSec));
+                $txRate = max(0, (int) round(($counters['tx'] - $prev['tx']) / $elapsedSec));
+            }
+            $totalRxRate += $rxRate;
+            $totalTxRate += $txRate;
+            $outIfaces[$name] = [
+                'rx_bytes'    => $counters['rx'],
+                'tx_bytes'    => $counters['tx'],
+                'rx_rate_bps' => $rxRate,
+                'tx_rate_bps' => $txRate,
+            ];
+        }
+
+        $this->prevNetSnap = ['ts_ns' => $nowNs, 'ifaces' => $ifaces];
+
+        return [
+            'rx_rate_bps' => $totalRxRate,
+            'tx_rate_bps' => $totalTxRate,
+            'interfaces'  => $outIfaces,
+        ];
+    }
+
+    /**
+     * @return list<array<string, mixed>>
+     */
+    private function getMountedFilesystemsUsage(): array
+    {
+        $res = $this->runCommand(['df', '-B1', '-T', '-x', 'tmpfs', '-x', 'devtmpfs', '-x', 'squashfs', '-x', 'overlay'], null, 5);
+        if ($res['exit_code'] !== 0) {
+            return [];
+        }
+
+        $lines = explode("\n", trim($res['stdout']));
+        array_shift($lines);
+        $disks = [];
+
+        foreach ($lines as $line) {
+            $cols = preg_split('/\s+/', trim($line), 7);
+            if (!is_array($cols) || count($cols) < 7) {
+                continue;
+            }
+            $total = (int) $cols[2];
+            $used = (int) $cols[3];
+            $avail = (int) $cols[4];
+            $disks[] = [
+                'device'       => $cols[0],
+                'fstype'       => $cols[1],
+                'total_bytes'  => $total,
+                'used_bytes'   => $used,
+                'avail_bytes'  => $avail,
+                'used_percent' => $total > 0 ? round(($used / $total) * 100, 1) : 0.0,
+                'mountpoint'   => $cols[6],
+            ];
+        }
+
+        return $disks;
+    }
+
+    /**
+     * @return list<array{sensor: string, label: string, celsius: float}>
+     */
+    private function readTemperatures(): array
+    {
+        $temps = [];
+
+        if ($this->commandExists('sensors')) {
+            $res = $this->runCommand(['sensors', '-j'], null, 4);
+            if ($res['exit_code'] === 0) {
+                $decoded = json_decode($res['stdout'], true);
+                if (is_array($decoded)) {
+                    foreach ($decoded as $chip => $features) {
+                        if (!is_array($features)) {
+                            continue;
+                        }
+                        foreach ($features as $featureName => $values) {
+                            if (!is_array($values)) {
+                                continue;
+                            }
+                            foreach ($values as $key => $val) {
+                                if (is_string($key) && str_ends_with($key, '_input') && str_starts_with($key, 'temp') && is_numeric($val)) {
+                                    $celsius = round((float) $val, 1);
+                                    if ($celsius > -20 && $celsius < 150) {
+                                        $temps[] = [
+                                            'sensor'  => (string) $chip,
+                                            'label'   => (string) $featureName,
+                                            'celsius' => $celsius,
+                                        ];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback sur /sys/class/thermal si lm-sensors ne remonte rien (ex: Mini-PC / ARM / VM)
+        if ($temps === [] && is_dir('/sys/class/thermal')) {
+            $zones = glob('/sys/class/thermal/thermal_zone*') ?: [];
+            foreach ($zones as $zone) {
+                $tempFile = $zone . '/temp';
+                $typeFile = $zone . '/type';
+                if (is_readable($tempFile)) {
+                    $milli = (int) trim((string) file_get_contents($tempFile));
+                    if ($milli > 0) {
+                        $temps[] = [
+                            'sensor'  => basename($zone),
+                            'label'   => is_readable($typeFile) ? trim((string) file_get_contents($typeFile)) : basename($zone),
+                            'celsius' => round($milli / 1000, 1),
+                        ];
+                    }
+                }
+            }
+        }
+
+        return $temps;
+    }
+
+    /**
+     * Santé SMART des disques physiques via smartmontools
+     *
+     * @return array<string, mixed>
+     */
+    private function handleSystemSmart(): array
+    {
+        if (!$this->commandExists('smartctl')) {
+            return ['available' => false, 'disks' => []];
+        }
+
+        $lsblk = $this->runCommand(['lsblk', '-J', '-d', '-o', 'NAME,PATH,SIZE,MODEL,TYPE,ROTA,TRAN'], null, 6);
+        $devices = json_decode($lsblk['stdout'], true)['blockdevices'] ?? [];
+        $smartList = [];
+
+        foreach ($devices as $dev) {
+            if (($dev['type'] ?? '') !== 'disk') {
+                continue;
+            }
+            $path = (string) ($dev['path'] ?? ('/dev/' . $dev['name']));
+            if (str_starts_with($path, '/dev/loop') || str_starts_with($path, '/dev/ram') || str_starts_with($path, '/dev/zram')) {
+                continue;
+            }
+
+            $res = $this->runCommand(['smartctl', '--json=c', '-i', '-H', '-A', $path], null, 10);
+            $smartJson = json_decode($res['stdout'], true) ?: [];
+
+            $passed = $smartJson['smart_status']['passed'] ?? null;
+            $temp = $smartJson['temperature']['current'] ?? null;
+            $powerOnHours = $smartJson['power_on_time']['hours'] ?? null;
+
+            $smartList[] = [
+                'name'           => $dev['name'],
+                'path'           => $path,
+                'model'          => trim((string) ($smartJson['model_name'] ?? $dev['model'] ?? 'Disque')),
+                'serial'         => $smartJson['serial_number'] ?? null,
+                'size'           => $dev['size'] ?? null,
+                'rotational'     => (bool) ($dev['rota'] ?? false),
+                'transport'      => $dev['tran'] ?? null,
+                'healthy'        => is_bool($passed) ? $passed : null,
+                'temperature_c'  => is_numeric($temp) ? (float) $temp : null,
+                'power_on_hours' => is_numeric($powerOnHours) ? (int) $powerOnHours : null,
+            ];
+        }
+
+        return [
+            'available' => true,
+            'disks'     => $smartList,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleSystemPower(array $params): array
+    {
+        $mode = (string) ($params['mode'] ?? '');
+        if (!in_array($mode, ['reboot', 'poweroff'], true)) {
+            throw new AgentError('INVALID_POWER_MODE', 'Mode attendu : reboot ou poweroff.');
+        }
+
+        // Délai de 2 secondes en arrière-plan pour laisser la réponse HTTP parvenir au navigateur PWA (qui affichera offline.html)
+        $sysCmd = $mode === 'reboot' ? 'systemctl reboot' : 'systemctl poweroff';
+        exec(sprintf('nohup /bin/sh -c %s >/dev/null 2>&1 &', escapeshellarg("sleep 2 && {$sysCmd}")));
+
+        return [
+            'scheduled' => true,
+            'mode'      => $mode,
+            'delay_sec' => 2,
+        ];
+    }
+
+    // ==========================================================================
+    // 2. STOCKAGE (LSBLK, MOUNT) & PARTAGES SAMBA
+    // ==========================================================================
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleStorageLsblk(): array
+    {
+        $res = $this->runCommand([
+            'lsblk', '-J', '-b', '-o',
+            'NAME,PATH,SIZE,TYPE,FSTYPE,LABEL,UUID,MOUNTPOINT,MODEL,ROTA,FSUSED,FSUSE%',
+        ], null, 8);
+
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('LSBLK_ERROR', trim($res['stderr'] ?: 'Erreur lors de la lecture des blocs.'), 500);
+        }
+
+        $decoded = json_decode($res['stdout'], true);
+        return [
+            'blockdevices' => $decoded['blockdevices'] ?? [],
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleStorageMount(array $params): array
+    {
+        $source = trim((string) ($params['source'] ?? '')); // /dev/sdX1 ou UUID=...
+        $folder = trim((string) ($params['folder'] ?? '')); // Nom du sous-dossier dans /mnt/<folder>
+
+        if ($source === '' || (preg_match('#^/dev/[a-zA-Z0-9_-]+$#', $source) !== 1 && preg_match('/^UUID=[a-fA-F0-9-]+$/', $source) !== 1)) {
+            throw new AgentError('INVALID_DEVICE', 'Périphérique ou UUID invalide.');
+        }
+        if (preg_match('/^[a-zA-Z0-9_-]{1,48}$/', $folder) !== 1) {
+            throw new AgentError('INVALID_MOUNTPOINT', 'Nom de dossier de montage invalide (alphanumérique, tirets).');
+        }
+
+        $mountPoint = '/mnt/' . $folder;
+        if (!is_dir($mountPoint) && !mkdir($mountPoint, 0755, true) && !is_dir($mountPoint)) {
+            throw new AgentError('MKDIR_FAILED', "Impossible de créer {$mountPoint}.", 500);
+        }
+
+        $res = $this->runCommand(['mount', $source, $mountPoint], null, 15);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('MOUNT_FAILED', trim($res['stderr'] ?: $res['stdout']), 400);
+        }
+
+        return [
+            'mounted'    => true,
+            'source'     => $source,
+            'mountpoint' => $mountPoint,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleStorageUmount(array $params): array
+    {
+        $mountPoint = rtrim(trim((string) ($params['mountpoint'] ?? '')), '/');
+        if (preg_match('#^/mnt/[a-zA-Z0-9_-]{1,48}$#', $mountPoint) !== 1) {
+            throw new AgentError('FORBIDDEN_UMOUNT', 'Seuls les points de montage situés dans /mnt/<nom> peuvent être démontés.');
+        }
+
+        $res = $this->runCommand(['umount', $mountPoint], null, 15);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('UMOUNT_FAILED', trim($res['stderr'] ?: $res['stdout']), 400);
+        }
+
+        return [
+            'unmounted'  => true,
+            'mountpoint' => $mountPoint,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleSambaList(): array
+    {
+        $installed = $this->commandExists('smbd');
+        $shares = [];
+
+        if (is_readable(self::SAMBA_SHARES_FILE)) {
+            $lines = file(self::SAMBA_SHARES_FILE, FILE_IGNORE_NEW_LINES) ?: [];
+            $current = null;
+            foreach ($lines as $line) {
+                $trimmed = trim($line);
+                if ($trimmed === '' || str_starts_with($trimmed, '#') || str_starts_with($trimmed, ';')) {
+                    continue;
+                }
+                if (preg_match('/^\[([a-zA-Z0-9_.-]+)\]$/', $trimmed, $m)) {
+                    if ($current !== null) {
+                        $shares[] = $current;
+                    }
+                    $current = [
+                        'name'       => $m[1],
+                        'path'       => '',
+                        'read_only'  => false,
+                        'guest_ok'   => false,
+                        'browseable' => true,
+                        'comment'    => '',
+                    ];
+                } elseif ($current !== null && str_contains($trimmed, '=')) {
+                    [$k, $v] = array_map('trim', explode('=', $trimmed, 2));
+                    $k = strtolower($k);
+                    if ($k === 'path') {
+                        $current['path'] = $v;
+                    } elseif ($k === 'comment') {
+                        $current['comment'] = $v;
+                    } elseif ($k === 'read only') {
+                        $current['read_only'] = in_array(strtolower($v), ['yes', 'true', '1'], true);
+                    } elseif ($k === 'guest ok') {
+                        $current['guest_ok'] = in_array(strtolower($v), ['yes', 'true', '1'], true);
+                    } elseif ($k === 'browseable') {
+                        $current['browseable'] = in_array(strtolower($v), ['yes', 'true', '1'], true);
+                    }
+                }
+            }
+            if ($current !== null) {
+                $shares[] = $current;
+            }
+        }
+
+        return [
+            'installed' => $installed,
+            'shares'    => $shares,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleSambaSave(array $params): array
+    {
+        if (!$this->commandExists('smbd')) {
+            throw new AgentError('SAMBA_NOT_INSTALLED', 'Le paquet samba n\'est pas installé sur ce serveur.');
+        }
+
+        $shares = $params['shares'] ?? null;
+        if (!is_array($shares)) {
+            throw new AgentError('INVALID_SHARES', 'Liste de partages attendue.');
+        }
+
+        $buf = "# Managed automatically by Vanill-IA OS — Do not edit manually\n\n";
+        foreach ($shares as $share) {
+            if (!is_array($share)) {
+                continue;
+            }
+            $name = trim((string) ($share['name'] ?? ''));
+            $path = trim((string) ($share['path'] ?? ''));
+            $comment = preg_replace('/[\r\n]+/', ' ', trim((string) ($share['comment'] ?? 'Partage Vanill-IA OS')));
+
+            if (preg_match('/^[a-zA-Z0-9_.-]{1,32}$/', $name) !== 1 || strtolower($name) === 'global') {
+                throw new AgentError('INVALID_SHARE_NAME', "Nom de partage Samba invalide : {$name}");
+            }
+            if ($path === '' || !str_starts_with($path, '/') || str_contains($path, '..') || in_array($path, ['/', '/etc', '/root', '/proc', '/sys'], true)) {
+                throw new AgentError('INVALID_SHARE_PATH', "Chemin de partage non autorisé : {$path}");
+            }
+
+            $readOnly = !empty($share['read_only']) ? 'yes' : 'no';
+            $guestOk = !empty($share['guest_ok']) ? 'yes' : 'no';
+            $browseable = ($share['browseable'] ?? true) ? 'yes' : 'no';
+
+            $buf .= "[{$name}]\n";
+            $buf .= "   comment = {$comment}\n";
+            $buf .= "   path = {$path}\n";
+            $buf .= "   browseable = {$browseable}\n";
+            $buf .= "   read only = {$readOnly}\n";
+            $buf .= "   guest ok = {$guestOk}\n";
+            $buf .= "   create mask = 0664\n";
+            $buf .= "   directory mask = 0775\n\n";
+        }
+
+        if (!is_dir('/etc/samba')) {
+            mkdir('/etc/samba', 0755, true);
+        }
+        file_put_contents(self::SAMBA_SHARES_FILE, $buf);
+        chmod(self::SAMBA_SHARES_FILE, 0644);
+
+        $smbConf = '/etc/samba/smb.conf';
+        if (is_file($smbConf)) {
+            $mainContent = (string) file_get_contents($smbConf);
+            if (!str_contains($mainContent, self::SAMBA_SHARES_FILE)) {
+                file_put_contents($smbConf, $mainContent . "\ninclude = " . self::SAMBA_SHARES_FILE . "\n");
+            }
+        }
+
+        $this->runCommand(['systemctl', 'reload-or-restart', 'smbd'], null, 15);
+
+        return ['saved' => true, 'count' => count($shares)];
+    }
+
+    /**
+     * Vérifie la présence de `cifs-utils` (`mount.cifs`) et liste les partages montés via `findmnt -t cifs,smb3 -J`.
+     *
+     * @return array<string, mixed>
+     */
+    private function handleCifsStatus(): array
+    {
+        $cifsInstalled = is_executable('/sbin/mount.cifs')
+            || is_executable('/usr/sbin/mount.cifs')
+            || $this->commandExists('mount.cifs');
+
+        $mounts = [];
+        if ($this->commandExists('findmnt')) {
+            $res = $this->runCommand(['findmnt', '-t', 'cifs,smb3', '-J', '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'], null, 6);
+            if ($res['exit_code'] === 0 && trim($res['stdout']) !== '') {
+                $decoded = json_decode($res['stdout'], true);
+                $fsList = $decoded['filesystems'] ?? [];
+                $flatten = static function (array $nodes) use (&$flatten, &$mounts): void {
+                    foreach ($nodes as $node) {
+                        if (!is_array($node)) {
+                            continue;
+                        }
+                        $mounts[] = [
+                            'target'  => (string) ($node['target'] ?? ''),
+                            'source'  => (string) ($node['source'] ?? ''),
+                            'fstype'  => (string) ($node['fstype'] ?? 'cifs'),
+                            'options' => (string) ($node['options'] ?? ''),
+                        ];
+                        if (!empty($node['children']) && is_array($node['children'])) {
+                            $flatten($node['children']);
+                        }
+                    }
+                };
+                $flatten($fsList);
+            }
+        }
+
+        // Enrichissement optionnel avec l'espace disque consommé/disponible via df
+        if ($mounts !== []) {
+            $dfMap = [];
+            foreach ($this->getMountedFilesystemsUsage() as $d) {
+                $dfMap[(string) $d['mountpoint']] = $d;
+            }
+            foreach ($mounts as &$m) {
+                $usage = $dfMap[$m['target']] ?? null;
+                $m['total_bytes'] = $usage['total_bytes'] ?? null;
+                $m['used_bytes'] = $usage['used_bytes'] ?? null;
+                $m['avail_bytes'] = $usage['avail_bytes'] ?? null;
+                $m['used_percent'] = $usage['used_percent'] ?? null;
+            }
+            unset($m);
+        }
+
+        return [
+            'cifs_installed' => $cifsInstalled,
+            'mounts'         => $mounts,
+        ];
+    }
+
+    /**
+     * Monte un partage réseau SMB/CIFS avec fichier d'identifiants éphémère `/tmp/.smb-cred-XXXX` (0600)
+     * supprimé (`unlink`) immédiatement après l'exécution de `mount`. Zéro secret persistant.
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleCifsMount(array $params): array
+    {
+        $cifsInstalled = is_executable('/sbin/mount.cifs')
+            || is_executable('/usr/sbin/mount.cifs')
+            || $this->commandExists('mount.cifs');
+
+        if (!$cifsInstalled) {
+            throw new AgentError(
+                'CIFS_UTILS_MISSING',
+                'Package cifs-utils (mount.cifs) is not installed on this Debian server.',
+                424
+            );
+        }
+
+        $host = trim((string) ($params['host'] ?? ''));
+        $share = trim((string) ($params['share'] ?? ''), " \t\n\r\0\x0B/\\");
+        $mountPoint = rtrim(trim((string) ($params['mountpoint'] ?? '')), '/');
+        $username = str_replace(["\r", "\n", "\0"], '', trim((string) ($params['username'] ?? '')));
+        $password = str_replace(["\r", "\n", "\0"], '', (string) ($params['password'] ?? ''));
+        $domain = str_replace(["\r", "\n", "\0"], '', trim((string) ($params['domain'] ?? '')));
+        $smbVers = trim((string) ($params['vers'] ?? ''));
+        $readOnly = !empty($params['read_only']);
+
+        // Validation stricte par regex (zéro injection d'options ou de chemins)
+        if (preg_match('/^[a-zA-Z0-9._-]{1,253}$/', $host) !== 1 || str_starts_with($host, '-')) {
+            throw new AgentError('INVALID_SMB_HOST', 'Invalid SMB host or IP address.');
+        }
+        if ($share === '' || str_contains($share, '..') || preg_match('#^[a-zA-Z0-9._\s/-]{1,128}$#', $share) !== 1) {
+            throw new AgentError('INVALID_SMB_SHARE', 'Invalid SMB share name.');
+        }
+        if (preg_match('#^/mnt/[a-zA-Z0-9_-]{1,48}$#', $mountPoint) !== 1) {
+            throw new AgentError('INVALID_MOUNTPOINT', 'Local mount point must match /mnt/<folder_name> (alphanumeric, hyphens, underscores).');
+        }
+        if ($domain !== '' && preg_match('/^[a-zA-Z0-9._-]{1,64}$/', $domain) !== 1) {
+            throw new AgentError('INVALID_SMB_DOMAIN', 'Invalid SMB domain/workgroup.');
+        }
+        if ($smbVers !== '' && $smbVers !== 'auto' && !in_array($smbVers, ['3.1.1', '3.0', '2.1', '2.0'], true)) {
+            throw new AgentError('INVALID_SMB_VERSION', 'Allowed SMB versions: auto, 3.1.1, 3.0, 2.1, 2.0.');
+        }
+
+        if (!is_dir($mountPoint) && !mkdir($mountPoint, 0755, true) && !is_dir($mountPoint)) {
+            throw new AgentError('MKDIR_FAILED', "Unable to create mount directory {$mountPoint}.", 500);
+        }
+
+        // Vérifie que le point de montage n'est pas déjà occupé
+        $checkMnt = $this->runCommand(['findmnt', '-M', $mountPoint], null, 5);
+        if ($checkMnt['exit_code'] === 0) {
+            throw new AgentError('ALREADY_MOUNTED', "Mount point {$mountPoint} is already mounted.");
+        }
+
+        $wwwDataPw = function_exists('posix_getpwnam') ? @posix_getpwnam('www-data') : false;
+        $uid = is_array($wwwDataPw) ? (int) $wwwDataPw['uid'] : 33;
+        $gid = is_array($wwwDataPw) ? (int) $wwwDataPw['gid'] : 33;
+
+        $options = [
+            $readOnly ? 'ro' : 'rw',
+            'iocharset=utf8',
+            "uid={$uid}",
+            "gid={$gid}",
+            'file_mode=0660',
+            'dir_mode=0770',
+            'nofail',
+        ];
+        if ($smbVers !== '' && $smbVers !== 'auto') {
+            $options[] = "vers={$smbVers}";
+        }
+
+        $credFile = null;
+        try {
+            if ($username === '' && $password === '') {
+                $options[] = 'guest';
+            } else {
+                $credFile = '/tmp/.smb-cred-' . bin2hex(random_bytes(8));
+                $oldUmask = umask(0077);
+                $fp = @fopen($credFile, 'wb');
+                umask($oldUmask);
+
+                if ($fp === false) {
+                    throw new AgentError('CRED_FILE_ERROR', 'Unable to allocate temporary credentials file in /tmp.', 500);
+                }
+                @chmod($credFile, 0600);
+
+                $credLines = "username={$username}\npassword={$password}\n";
+                if ($domain !== '') {
+                    $credLines .= "domain={$domain}\n";
+                }
+                fwrite($fp, $credLines);
+                fclose($fp);
+
+                $options[] = "credentials={$credFile}";
+            }
+
+            $uncSource = "//{$host}/{$share}";
+            $res = $this->runCommand([
+                'mount',
+                '-t',
+                'cifs',
+                $uncSource,
+                $mountPoint,
+                '-o',
+                implode(',', $options),
+            ], null, 25);
+        } finally {
+            // Suppression garantie et immédiate du fichier temporaire de secrets
+            if ($credFile !== null && file_exists($credFile)) {
+                @unlink($credFile);
+            }
+        }
+
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError(
+                'CIFS_MOUNT_FAILED',
+                trim($res['stderr'] ?: $res['stdout'] ?: 'SMB/CIFS mount failed.'),
+                400
+            );
+        }
+
+        return $this->handleCifsStatus();
+    }
+
+    /**
+     * Démonte proprement un partage SMB/CIFS monté dans `/mnt/<nom>`.
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleCifsUmount(array $params): array
+    {
+        $mountPoint = rtrim(trim((string) ($params['mountpoint'] ?? '')), '/');
+        if (preg_match('#^/mnt/[a-zA-Z0-9_-]{1,48}$#', $mountPoint) !== 1) {
+            throw new AgentError('FORBIDDEN_UMOUNT', 'Only SMB/CIFS shares mounted inside /mnt/<folder> can be unmounted.');
+        }
+
+        $status = $this->handleCifsStatus();
+        $isCifs = false;
+        foreach ($status['mounts'] as $m) {
+            if ($m['target'] === $mountPoint) {
+                $isCifs = true;
+                break;
+            }
+        }
+        if (!$isCifs) {
+            throw new AgentError('NOT_CIFS_MOUNT', "No active SMB/CIFS share found on {$mountPoint}.", 404);
+        }
+
+        $lazy = !empty($params['lazy']);
+        $cmd = $lazy ? ['umount', '-l', $mountPoint] : ['umount', $mountPoint];
+        $res = $this->runCommand($cmd, null, 15);
+
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('CIFS_UMOUNT_FAILED', trim($res['stderr'] ?: $res['stdout']), 400);
+        }
+
+        return $this->handleCifsStatus();
+    }
+
+    // ==========================================================================
+    // 3. RÉSEAU & SÉCURITÉ (INTERFACES, UFW, FAIL2BAN, TAILSCALE)
+    // ==========================================================================
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleNetworkInterfaces(): array
+    {
+        $addrRes = $this->runCommand(['ip', '-j', 'addr'], null, 5);
+        $routeRes = $this->runCommand(['ip', '-j', 'route'], null, 5);
+
+        $dns = [];
+        if (is_readable('/etc/resolv.conf')) {
+            $lines = file('/etc/resolv.conf', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+            foreach ($lines as $line) {
+                if (preg_match('/^nameserver\s+(\S+)/', trim($line), $m)) {
+                    $dns[] = $m[1];
+                }
+            }
+        }
+
+        return [
+            'interfaces'  => json_decode($addrRes['stdout'], true) ?: [],
+            'routes'      => json_decode($routeRes['stdout'], true) ?: [],
+            'nameservers' => $dns,
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleUfwStatus(): array
+    {
+        if (!$this->commandExists('ufw')) {
+            return ['installed' => false, 'active' => false, 'rules' => []];
+        }
+
+        $res = $this->runCommand(['ufw', 'status', 'numbered'], null, 8);
+        $out = $res['stdout'];
+        $active = str_contains($out, 'Status: active');
+        $rules = [];
+
+        foreach (explode("\n", $out) as $line) {
+            if (preg_match('/^\[\s*(\d+)\]\s+(.+?)\s{2,}(ALLOW IN|DENY IN|REJECT IN|LIMIT IN|ALLOW OUT|DENY OUT)\s{2,}(.+)$/', trim($line), $m)) {
+                $rules[] = [
+                    'number' => (int) $m[1],
+                    'to'     => trim($m[2]),
+                    'action' => trim($m[3]),
+                    'from'   => trim($m[4]),
+                ];
+            }
+        }
+
+        return [
+            'installed' => true,
+            'active'    => $active,
+            'rules'     => $rules,
+            'raw'       => trim($out),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleUfwRule(array $params): array
+    {
+        $operation = (string) ($params['operation'] ?? 'allow');
+        if ($operation === 'delete') {
+            $ruleNumber = (int) ($params['number'] ?? 0);
+            if ($ruleNumber <= 0) {
+                throw new AgentError('INVALID_RULE_NUMBER', 'Numéro de règle UFW invalide.');
+            }
+            $res = $this->runCommand(['ufw', '--force', 'delete', (string) $ruleNumber], null, 10);
+            if ($res['exit_code'] !== 0) {
+                throw new AgentError('UFW_ERROR', trim($res['stderr'] ?: $res['stdout']));
+            }
+            return $this->handleUfwStatus();
+        }
+
+        if (!in_array($operation, ['allow', 'deny', 'limit'], true)) {
+            throw new AgentError('INVALID_UFW_OP', 'Opération attendue : allow, deny, limit ou delete.');
+        }
+
+        $portSpec = trim((string) ($params['port'] ?? ''));
+        $proto = strtolower(trim((string) ($params['proto'] ?? 'tcp')));
+
+        if (preg_match('/^\d{1,5}(:\d{1,5})?$/', $portSpec) !== 1) {
+            throw new AgentError('INVALID_PORT', 'Port ou plage de ports invalide (ex: 443 ou 8000:8010).');
+        }
+        if (!in_array($proto, ['tcp', 'udp', 'any'], true)) {
+            throw new AgentError('INVALID_PROTO', 'Protocole attendu : tcp, udp ou any.');
+        }
+
+        $target = $proto === 'any' ? $portSpec : "{$portSpec}/{$proto}";
+        $res = $this->runCommand(['ufw', $operation, $target], null, 10);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('UFW_ERROR', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        return $this->handleUfwStatus();
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleUfwToggle(array $params): array
+    {
+        $enable = (bool) ($params['enable'] ?? false);
+        if ($enable) {
+            // Garde-fou anti-lockout : s'assurer que SSH (22) et les ports WebOS (8443/8080) restent ouverts
+            $this->runCommand(['ufw', 'allow', '22/tcp'], null, 8);
+            $this->runCommand(['ufw', 'allow', '8443/tcp'], null, 8);
+            $this->runCommand(['ufw', 'allow', '8080/tcp'], null, 8);
+            $res = $this->runCommand(['ufw', '--force', 'enable'], null, 10);
+        } else {
+            $res = $this->runCommand(['ufw', 'disable'], null, 10);
+        }
+
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('UFW_TOGGLE_ERROR', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        return $this->handleUfwStatus();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleFail2banStatus(): array
+    {
+        if (!$this->commandExists('fail2ban-client')) {
+            return ['installed' => false, 'running' => false, 'jails' => []];
+        }
+
+        $res = $this->runCommand(['fail2ban-client', 'status'], null, 6);
+        if ($res['exit_code'] !== 0) {
+            return ['installed' => true, 'running' => false, 'jails' => []];
+        }
+
+        $jails = [];
+        if (preg_match('/Jail list:\s*(.+)$/m', $res['stdout'], $m)) {
+            $jailNames = array_filter(array_map('trim', explode(',', $m[1])));
+            foreach ($jailNames as $jail) {
+                $jRes = $this->runCommand(['fail2ban-client', 'status', $jail], null, 6);
+                if ($jRes['exit_code'] !== 0) {
+                    continue;
+                }
+                $currentlyBanned = 0;
+                $totalBanned = 0;
+                $bannedIps = [];
+
+                if (preg_match('/Currently banned:\s*(\d+)/', $jRes['stdout'], $jm)) {
+                    $currentlyBanned = (int) $jm[1];
+                }
+                if (preg_match('/Total banned:\s*(\d+)/', $jRes['stdout'], $jm)) {
+                    $totalBanned = (int) $jm[1];
+                }
+                if (preg_match('/Banned IP list:\s*(.*)$/m', $jRes['stdout'], $jm)) {
+                    $bannedIps = array_values(array_filter(preg_split('/\s+/', trim($jm[1])) ?: []));
+                }
+
+                $jails[] = [
+                    'name'             => $jail,
+                    'currently_banned' => $currentlyBanned,
+                    'total_banned'     => $totalBanned,
+                    'banned_ips'       => $bannedIps,
+                ];
+            }
+        }
+
+        return [
+            'installed' => true,
+            'running'   => true,
+            'jails'     => $jails,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFail2banUnban(array $params): array
+    {
+        $jail = trim((string) ($params['jail'] ?? ''));
+        $ip = trim((string) ($params['ip'] ?? ''));
+
+        if (preg_match('/^[a-zA-Z0-9_.-]{1,64}$/', $jail) !== 1) {
+            throw new AgentError('INVALID_JAIL', 'Nom de prison Fail2ban invalide.');
+        }
+        if (filter_var($ip, FILTER_VALIDATE_IP) === false) {
+            throw new AgentError('INVALID_IP', 'Adresse IP invalide.');
+        }
+
+        $res = $this->runCommand(['fail2ban-client', 'set', $jail, 'unbanip', $ip], null, 8);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('FAIL2BAN_UNBAN_ERROR', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        return $this->handleFail2banStatus();
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleTailscaleStatus(): array
+    {
+        if (!$this->commandExists('tailscale')) {
+            return ['installed' => false];
+        }
+
+        $res = $this->runCommand(['tailscale', 'status', '--json'], null, 6);
+        $json = json_decode($res['stdout'], true) ?: [];
+
+        return [
+            'installed'     => true,
+            'backend_state' => $json['BackendState'] ?? 'Unknown',
+            'self'          => $json['Self'] ?? null,
+            'tailscale_ips' => $json['TailscaleIPs'] ?? [],
+            'peers_count'   => isset($json['Peer']) && is_array($json['Peer']) ? count($json['Peer']) : 0,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleTailscaleAction(array $params): array
+    {
+        if (!$this->commandExists('tailscale')) {
+            throw new AgentError('TAILSCALE_NOT_INSTALLED', 'Tailscale n\'est pas installé.');
+        }
+
+        $sub = (string) ($params['subcommand'] ?? '');
+        if ($sub === 'down') {
+            $res = $this->runCommand(['tailscale', 'down'], null, 10);
+        } elseif ($sub === 'up') {
+            $cmd = ['tailscale', 'up', '--accept-routes'];
+            if (!empty($params['authkey']) && is_string($params['authkey'])) {
+                $cmd[] = '--authkey=' . trim($params['authkey']);
+            }
+            $res = $this->runCommand($cmd, null, 20);
+        } else {
+            throw new AgentError('INVALID_TAILSCALE_ACTION', 'Sous-commande attendue : up ou down.');
+        }
+
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('TAILSCALE_ERROR', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        return $this->handleTailscaleStatus();
+    }
+
+    // ==========================================================================
+    // 4. SERVICES SYSTEMD & GESTIONNAIRE APT
+    // ==========================================================================
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleServiceList(array $params): array
+    {
+        $filter = strtolower(trim((string) ($params['search'] ?? '')));
+        $res = $this->runCommand([
+            'systemctl', 'list-units', '--type=service', '--all', '--no-pager', '--no-legend', '--plain',
+        ], null, 10);
+
+        $services = [];
+        foreach (explode("\n", trim($res['stdout'])) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            $cols = preg_split('/\s+/', $line, 5);
+            if (!is_array($cols) || count($cols) < 4) {
+                continue;
+            }
+            $unit = $cols[0];
+            $desc = $cols[4] ?? '';
+            if ($filter !== '' && !str_contains(strtolower($unit . ' ' . $desc), $filter)) {
+                continue;
+            }
+            $services[] = [
+                'unit'        => $unit,
+                'load'        => $cols[1],
+                'active'      => $cols[2],
+                'sub'         => $cols[3],
+                'description' => $desc,
+            ];
+        }
+
+        return ['services' => $services];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleServiceAction(array $params): array
+    {
+        $unit = trim((string) ($params['unit'] ?? ''));
+        $op = trim((string) ($params['operation'] ?? ''));
+
+        if (preg_match('/^[a-zA-Z0-9@_.:-]{1,128}$/', $unit) !== 1) {
+            throw new AgentError('INVALID_UNIT', 'Nom d\'unité systemd invalide.');
+        }
+        if (!str_ends_with($unit, '.service')) {
+            $unit .= '.service';
+        }
+        if (!in_array($op, ['start', 'stop', 'restart', 'reload', 'enable', 'disable'], true)) {
+            throw new AgentError('INVALID_SERVICE_OP', 'Opération systemd non autorisée.');
+        }
+        if ($unit === 'vanill-ia-agent.service' && in_array($op, ['stop', 'disable'], true)) {
+            throw new AgentError('PROTECTED_SERVICE', 'Impossible d\'arrêter vanill-ia-agent depuis le WebOS.');
+        }
+
+        $res = $this->runCommand(['systemctl', $op, $unit], null, 30);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('SYSTEMCTL_ERROR', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        $stateRes = $this->runCommand(['systemctl', 'is-active', $unit], null, 5);
+
+        return [
+            'unit'      => $unit,
+            'operation' => $op,
+            'active'    => trim($stateRes['stdout']),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleServiceLogs(array $params): array
+    {
+        $unit = trim((string) ($params['unit'] ?? ''));
+        $lines = max(10, min(500, (int) ($params['lines'] ?? 120)));
+
+        if (preg_match('/^[a-zA-Z0-9@_.:-]{1,128}$/', $unit) !== 1) {
+            throw new AgentError('INVALID_UNIT', 'Nom d\'unité systemd invalide.');
+        }
+
+        $res = $this->runCommand([
+            'journalctl', '-u', $unit, '-n', (string) $lines, '--no-pager', '-o', 'short-iso',
+        ], null, 10);
+
+        return [
+            'unit' => $unit,
+            'logs' => $res['stdout'],
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleAptStatus(array $params): array
+    {
+        $refresh = (bool) ($params['refresh'] ?? false);
+        if ($refresh) {
+            $upd = $this->runCommand(['apt-get', 'update', '-q'], null, 90, ['DEBIAN_FRONTEND' => 'noninteractive']);
+            if ($upd['exit_code'] !== 0) {
+                throw new AgentError('APT_UPDATE_ERROR', trim($upd['stderr'] ?: $upd['stdout']), 500);
+            }
+        }
+
+        $res = $this->runCommand(['apt', 'list', '--upgradable'], null, 20);
+        $packages = [];
+        foreach (explode("\n", trim($res['stdout'])) as $line) {
+            // Format: pkg/stable 1.2.3 amd64 [upgradable from: 1.2.2]
+            if (preg_match('#^([a-zA-Z0-9.+_-]+)/(\S+)\s+(\S+)\s+(\S+)\s+\[upgradable from:\s*([^\]]+)\]#', trim($line), $m)) {
+                $packages[] = [
+                    'name'            => $m[1],
+                    'suite'           => $m[2],
+                    'new_version'     => $m[3],
+                    'arch'            => $m[4],
+                    'current_version' => $m[5],
+                ];
+            }
+        }
+
+        return [
+            'upgradable_count' => count($packages),
+            'packages'         => $packages,
+            'reboot_required'  => file_exists('/var/run/reboot-required'),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleAptUpgrade(): array
+    {
+        $res = $this->runCommand([
+            'apt-get',
+            '-y',
+            '-o', 'Dpkg::Options::=--force-confdef',
+            '-o', 'Dpkg::Options::=--force-confold',
+            'upgrade',
+        ], null, 600, ['DEBIAN_FRONTEND' => 'noninteractive']);
+
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('APT_UPGRADE_ERROR', trim($res['stderr'] ?: $res['stdout']), 500);
+        }
+
+        return [
+            'upgraded'        => true,
+            'output'          => $res['stdout'],
+            'reboot_required' => file_exists('/var/run/reboot-required'),
+        ];
+    }
+
+    // ==========================================================================
+    // 5. DOCKER ENGINE (/var/run/docker.sock), STACKS COMPOSE & CADDY PROXY
+    // ==========================================================================
+
+    /**
+     * Client HTTP direct sur le socket Unix /var/run/docker.sock via ext-curl
+     *
+     * @param array<string, mixed>|null $jsonBody
+     * @return array{status: int, body: string, json: mixed}
+     */
+    private function dockerSocketRequest(string $method, string $path, ?array $jsonBody = null, int $timeoutSec = 15): array
+    {
+        if (!file_exists(self::DOCKER_SOCKET)) {
+            throw new AgentError('DOCKER_UNAVAILABLE', 'Socket Docker introuvable (/var/run/docker.sock). Vérifiez que le service docker est actif.', 503);
+        }
+
+        $ch = curl_init('http://localhost' . $path);
+        if ($ch === false) {
+            throw new AgentError('CURL_INIT_ERROR', 'Impossible d\'initialiser cURL.', 500);
+        }
+
+        $headers = ['Accept: application/json'];
+        if ($jsonBody !== null) {
+            $encoded = json_encode($jsonBody, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $encoded);
+            $headers[] = 'Content-Type: application/json';
+        }
+
+        curl_setopt_array($ch, [
+            CURLOPT_UNIX_SOCKET_PATH => self::DOCKER_SOCKET,
+            CURLOPT_CUSTOMREQUEST    => strtoupper($method),
+            CURLOPT_RETURNTRANSFER   => true,
+            CURLOPT_HTTPHEADER       => $headers,
+            CURLOPT_TIMEOUT          => $timeoutSec,
+            CURLOPT_CONNECTTIMEOUT   => 5,
+        ]);
+
+        $rawBody = curl_exec($ch);
+        $err = curl_error($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($rawBody === false) {
+            throw new AgentError('DOCKER_SOCKET_ERROR', 'Erreur de communication avec Docker : ' . $err, 502);
+        }
+
+        return [
+            'status' => $status,
+            'body'   => (string) $rawBody,
+            'json'   => json_decode((string) $rawBody, true),
+        ];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleDockerInfo(): array
+    {
+        $info = $this->dockerSocketRequest('GET', '/info', null, 8);
+        if ($info['status'] >= 400 || !is_array($info['json'])) {
+            throw new AgentError('DOCKER_INFO_ERROR', 'Impossible de lire les informations Docker.', 502);
+        }
+
+        $d = $info['json'];
+        return [
+            'server_version'     => $d['ServerVersion'] ?? 'unknown',
+            'containers_total'   => $d['Containers'] ?? 0,
+            'containers_running' => $d['ContainersRunning'] ?? 0,
+            'containers_paused'  => $d['ContainersPaused'] ?? 0,
+            'containers_stopped' => $d['ContainersStopped'] ?? 0,
+            'images'             => $d['Images'] ?? 0,
+            'driver'             => $d['Driver'] ?? '',
+            'operating_system'   => $d['OperatingSystem'] ?? '',
+            'architecture'       => $d['Architecture'] ?? '',
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerContainers(array $params): array
+    {
+        $all = ($params['all'] ?? true) ? '1' : '0';
+        $res = $this->dockerSocketRequest('GET', "/containers/json?all={$all}", null, 10);
+        if ($res['status'] >= 400 || !is_array($res['json'])) {
+            throw new AgentError('DOCKER_LIST_ERROR', 'Impossible de lister les conteneurs Docker.', 502);
+        }
+
+        $containers = [];
+        foreach ($res['json'] as $item) {
+            $names = $item['Names'] ?? [];
+            $primaryName = isset($names[0]) ? ltrim((string) $names[0], '/') : substr((string) ($item['Id'] ?? ''), 0, 12);
+            $labels = is_array($item['Labels'] ?? null) ? $item['Labels'] : [];
+            $ports = [];
+            $webPort = null;
+
+            foreach (($item['Ports'] ?? []) as $p) {
+                $pubPort = isset($p['PublicPort']) ? (int) $p['PublicPort'] : null;
+                $privPort = (int) ($p['PrivatePort'] ?? 0);
+                $type = (string) ($p['Type'] ?? 'tcp');
+
+                $ports[] = [
+                    'ip'           => $p['IP'] ?? null,
+                    'private_port' => $privPort,
+                    'public_port'  => $pubPort,
+                    'type'         => $type,
+                ];
+
+                // Détection intelligente du port Web principal pour ouverture 1-clic (onglet ou iframe Bureau)
+                if ($pubPort !== null && $type === 'tcp' && $webPort === null) {
+                    if (!in_array($privPort, [22, 53, 3306, 5432, 6379, 27017], true)) {
+                        $webPort = $pubPort;
+                    }
+                }
+            }
+
+            $containers[] = [
+                'id'            => substr((string) ($item['Id'] ?? ''), 0, 12),
+                'full_id'       => (string) ($item['Id'] ?? ''),
+                'name'          => $primaryName,
+                'image'         => (string) ($item['Image'] ?? ''),
+                'state'         => (string) ($item['State'] ?? 'unknown'),
+                'status'        => (string) ($item['Status'] ?? ''),
+                'created'       => (int) ($item['Created'] ?? 0),
+                'ports'         => $ports,
+                'web_port'      => $webPort,
+                'compose_stack' => $labels['com.docker.compose.project'] ?? null,
+            ];
+        }
+
+        return ['containers' => $containers];
+    }
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleDockerStats(): array
+    {
+        if (!$this->commandExists('docker')) {
+            return ['stats' => []];
+        }
+
+        $res = $this->runCommand(['docker', 'stats', '--no-stream', '--format', '{{json .}}'], null, 10);
+        if ($res['exit_code'] !== 0) {
+            return ['stats' => []];
+        }
+
+        $stats = [];
+        foreach (explode("\n", trim($res['stdout'])) as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            $row = json_decode($line, true);
+            if (is_array($row)) {
+                $stats[] = [
+                    'id'          => $row['ID'] ?? '',
+                    'name'        => $row['Name'] ?? '',
+                    'cpu_percent' => $row['CPUPerc'] ?? '0.00%',
+                    'mem_usage'   => $row['MemUsage'] ?? '',
+                    'mem_percent' => $row['MemPerc'] ?? '0.00%',
+                    'net_io'      => $row['NetIO'] ?? '',
+                    'block_io'    => $row['BlockIO'] ?? '',
+                    'pids'        => $row['PIDs'] ?? '0',
+                ];
+            }
+        }
+
+        return ['stats' => $stats];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerContainerAction(array $params): array
+    {
+        $id = trim((string) ($params['id'] ?? ''));
+        $op = trim((string) ($params['operation'] ?? ''));
+
+        if (preg_match('/^[a-zA-Z0-9_.-]{2,128}$/', $id) !== 1) {
+            throw new AgentError('INVALID_CONTAINER_ID', 'Identifiant ou nom de conteneur invalide.');
+        }
+
+        $encodedId = rawurlencode($id);
+
+        return match ($op) {
+            'start' => $this->assertDockerAction($this->dockerSocketRequest('POST', "/containers/{$encodedId}/start", null, 20), $id, $op),
+            'stop'  => $this->assertDockerAction($this->dockerSocketRequest('POST', "/containers/{$encodedId}/stop?t=10", null, 25), $id, $op),
+            'restart' => $this->assertDockerAction($this->dockerSocketRequest('POST', "/containers/{$encodedId}/restart?t=10", null, 25), $id, $op),
+            'remove' => $this->assertDockerAction(
+                $this->dockerSocketRequest('DELETE', "/containers/{$encodedId}?force=" . (!empty($params['force']) ? '1' : '0') . '&v=' . (!empty($params['volumes']) ? '1' : '0'), null, 20),
+                $id,
+                $op
+            ),
+            'inspect' => (function () use ($encodedId): array {
+                $res = $this->dockerSocketRequest('GET', "/containers/{$encodedId}/json", null, 10);
+                if ($res['status'] >= 400 || !is_array($res['json'])) {
+                    throw new AgentError('DOCKER_INSPECT_ERROR', 'Conteneur introuvable.', 404);
+                }
+                return ['container' => $res['json']];
+            })(),
+            default => throw new AgentError('INVALID_DOCKER_OP', 'Opération attendue : start, stop, restart, remove, inspect.'),
+        };
+    }
+
+    /**
+     * @param array{status: int, body: string, json: mixed} $res
+     * @return array<string, mixed>
+     */
+    private function assertDockerAction(array $res, string $id, string $op): array
+    {
+        // Docker renvoie 204 (succès) ou 304 (déjà dans cet état)
+        if ($res['status'] >= 400) {
+            $msg = is_array($res['json']) && isset($res['json']['message'])
+                ? (string) $res['json']['message']
+                : trim($res['body']);
+            throw new AgentError('DOCKER_ACTION_FAILED', "Erreur Docker ({$op} sur {$id}) : {$msg}", $res['status']);
+        }
+
+        return ['id' => $id, 'operation' => $op, 'success' => true];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerContainerLogs(array $params): array
+    {
+        $id = trim((string) ($params['id'] ?? ''));
+        $lines = max(10, min(1000, (int) ($params['lines'] ?? 150)));
+
+        if (preg_match('/^[a-zA-Z0-9_.-]{2,128}$/', $id) !== 1) {
+            throw new AgentError('INVALID_CONTAINER_ID', 'Identifiant de conteneur invalide.');
+        }
+
+        $res = $this->runCommand(['docker', 'logs', '--tail', (string) $lines, '--timestamps', $id], null, 12);
+        $combined = $res['stdout'] . ($res['stderr'] !== '' ? ($res['stdout'] !== '' ? "\n" : '') . $res['stderr'] : '');
+
+        return [
+            'id'   => $id,
+            'logs' => $combined,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerContainerExec(array $params): array
+    {
+        $id = trim((string) ($params['id'] ?? ''));
+        $command = trim((string) ($params['command'] ?? ''));
+
+        if (preg_match('/^[a-zA-Z0-9_.-]{2,128}$/', $id) !== 1) {
+            throw new AgentError('INVALID_CONTAINER_ID', 'Identifiant de conteneur invalide.');
+        }
+        if ($command === '') {
+            throw new AgentError('EMPTY_COMMAND', 'Commande vide.');
+        }
+
+        $res = $this->runCommand(['docker', 'exec', $id, '/bin/sh', '-c', $command], null, 30);
+
+        return [
+            'id'        => $id,
+            'exit_code' => $res['exit_code'],
+            'stdout'    => $res['stdout'],
+            'stderr'    => $res['stderr'],
+        ];
+    }
+
+    /**
+     * Gestion des Stacks Docker Compose dans /var/lib/vanill-ia-os/stacks/<app>/docker-compose.yml
+     * (accessible également via le lien symbolique /opt/vanill-ia/stacks/<app>/docker-compose.yml)
+     *
+     * @return array<string, mixed>
+     */
+    private function handleDockerStacksList(): array
+    {
+        if (!is_dir(self::STACKS_DIR)) {
+            mkdir(self::STACKS_DIR, 0775, true);
+        }
+
+        $entries = scandir(self::STACKS_DIR) ?: [];
+        $stacks = [];
+
+        foreach ($entries as $entry) {
+            if ($entry === '.' || $entry === '..') {
+                continue;
+            }
+            $dir = self::STACKS_DIR . '/' . $entry;
+            $composeFile = $dir . '/docker-compose.yml';
+            if (!is_dir($dir) || !is_file($composeFile)) {
+                continue;
+            }
+
+            $stacks[] = [
+                'name'         => $entry,
+                'path'         => '/opt/vanill-ia/stacks/' . $entry . '/docker-compose.yml',
+                'has_env'      => is_file($dir . '/.env'),
+                'updated_at'   => gmdate('Y-m-d H:i:s', (int) filemtime($composeFile)),
+                'size_bytes'   => (int) filesize($composeFile),
+            ];
+        }
+
+        return ['stacks' => $stacks];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerStackGet(array $params): array
+    {
+        $name = $this->validateStackName((string) ($params['name'] ?? ''));
+        $dir = self::STACKS_DIR . '/' . $name;
+        $composeFile = $dir . '/docker-compose.yml';
+
+        if (!is_file($composeFile)) {
+            throw new AgentError('STACK_NOT_FOUND', "Stack introuvable : {$name}", 404);
+        }
+
+        return [
+            'name'        => $name,
+            'compose_yml' => (string) file_get_contents($composeFile),
+            'env_content' => is_file($dir . '/.env') ? (string) file_get_contents($dir . '/.env') : '',
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerStackSave(array $params): array
+    {
+        $name = $this->validateStackName((string) ($params['name'] ?? ''));
+        $composeYml = (string) ($params['compose_yml'] ?? '');
+        $envContent = isset($params['env_content']) && is_string($params['env_content']) ? $params['env_content'] : null;
+
+        if (trim($composeYml) === '') {
+            throw new AgentError('EMPTY_COMPOSE', 'Le contenu docker-compose.yml ne peut pas être vide.');
+        }
+
+        $dir = self::STACKS_DIR . '/' . $name;
+        if (!is_dir($dir) && !mkdir($dir, 0775, true) && !is_dir($dir)) {
+            throw new AgentError('MKDIR_FAILED', "Impossible de créer le dossier de stack {$dir}.", 500);
+        }
+
+        file_put_contents($dir . '/docker-compose.yml', str_replace("\r\n", "\n", $composeYml));
+        chmod($dir . '/docker-compose.yml', 0660);
+        @chgrp($dir . '/docker-compose.yml', 'www-data');
+
+        if ($envContent !== null) {
+            file_put_contents($dir . '/.env', str_replace("\r\n", "\n", $envContent));
+            chmod($dir . '/.env', 0640);
+            @chgrp($dir . '/.env', 'www-data');
+        }
+
+        // Validation syntaxique via docker compose config
+        if ($this->commandExists('docker')) {
+            $check = $this->runCommand(['docker', 'compose', 'config', '-q'], $dir, 15);
+            if ($check['exit_code'] !== 0) {
+                throw new AgentError('INVALID_COMPOSE_YAML', 'Erreur de syntaxe Docker Compose : ' . trim($check['stderr'] ?: $check['stdout']));
+            }
+        }
+
+        return [
+            'saved' => true,
+            'name'  => $name,
+            'path'  => '/opt/vanill-ia/stacks/' . $name . '/docker-compose.yml',
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleDockerStackAction(array $params): array
+    {
+        $name = $this->validateStackName((string) ($params['name'] ?? ''));
+        $op = (string) ($params['operation'] ?? '');
+        $dir = self::STACKS_DIR . '/' . $name;
+
+        if (!is_file($dir . '/docker-compose.yml')) {
+            throw new AgentError('STACK_NOT_FOUND', "Stack introuvable : {$name}", 404);
+        }
+
+        $cmd = match ($op) {
+            'up'      => ['docker', 'compose', 'up', '-d', '--remove-orphans'],
+            'down'    => ['docker', 'compose', 'down'],
+            'pull'    => ['docker', 'compose', 'pull'],
+            'restart' => ['docker', 'compose', 'restart'],
+            'delete'  => ['docker', 'compose', 'down', '--remove-orphans'],
+            default   => throw new AgentError('INVALID_STACK_OP', 'Opération attendue : up, down, pull, restart, delete.'),
+        };
+
+        $res = $this->runCommand($cmd, $dir, 300);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('COMPOSE_ACTION_FAILED', trim($res['stderr'] ?: $res['stdout']), 500);
+        }
+
+        if ($op === 'delete') {
+            @unlink($dir . '/docker-compose.yml');
+            @unlink($dir . '/.env');
+            @rmdir($dir);
+        }
+
+        return [
+            'name'      => $name,
+            'operation' => $op,
+            'output'    => trim($res['stdout'] . "\n" . $res['stderr']),
+        ];
+    }
+
+    private function validateStackName(string $name): string
+    {
+        $name = strtolower(trim($name));
+        if (preg_match('/^[a-z0-9][a-z0-9_-]{0,47}$/', $name) !== 1) {
+            throw new AgentError('INVALID_STACK_NAME', 'Nom de stack invalide (minuscules, chiffres, tirets uniquement).');
+        }
+        return $name;
+    }
+
+    // ==========================================================================
+    // 6. REVERSE PROXY CADDY (/etc/caddy/conf.d/app-*.caddy)
+    // ==========================================================================
+
+    /**
+     * @return array<string, mixed>
+     */
+    private function handleCaddyProxyList(): array
+    {
+        $pdo = $this->openDatabase();
+        $rows = $pdo->query('SELECT * FROM proxy_routes ORDER BY fqdn ASC')->fetchAll();
+        return ['routes' => $rows];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleCaddyProxySave(array $params): array
+    {
+        $fqdn = strtolower(trim((string) ($params['fqdn'] ?? '')));
+        $targetHost = trim((string) ($params['target_host'] ?? '127.0.0.1'));
+        $targetPort = (int) ($params['target_port'] ?? 0);
+        $targetScheme = strtolower(trim((string) ($params['target_scheme'] ?? 'http')));
+        $tlsMode = strtolower(trim((string) ($params['tls_mode'] ?? 'auto')));
+        $containerName = isset($params['container_name']) ? trim((string) $params['container_name']) : null;
+
+        if (preg_match('/^(?=.{3,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/', $fqdn) !== 1) {
+            throw new AgentError('INVALID_FQDN', 'Nom de domaine complet (FQDN) invalide (ex: jellyfin.monserveur.fr).');
+        }
+        if (preg_match('/^[a-zA-Z0-9._-]{1,128}$/', $targetHost) !== 1) {
+            throw new AgentError('INVALID_TARGET_HOST', 'Hôte cible invalide.');
+        }
+        if ($targetPort < 1 || $targetPort > 65535) {
+            throw new AgentError('INVALID_TARGET_PORT', 'Port cible invalide (1-65535).');
+        }
+        if (!in_array($targetScheme, ['http', 'https'], true)) {
+            throw new AgentError('INVALID_SCHEME', 'Schéma cible attendu : http ou https.');
+        }
+        if (!in_array($tlsMode, ['auto', 'internal', 'off'], true)) {
+            throw new AgentError('INVALID_TLS_MODE', 'Mode TLS attendu : auto, internal ou off.');
+        }
+
+        $slug = preg_replace('/[^a-z0-9-]+/', '-', $fqdn) ?: 'route';
+        $configPath = self::CADDY_CONF_DIR . '/app-' . $slug . '.caddy';
+
+        $siteAddress = $tlsMode === 'off' ? "http://{$fqdn}" : $fqdn;
+        $tlsDirective = $tlsMode === 'internal' ? "    tls internal\n" : '';
+        $tlsSkipVerify = $targetScheme === 'https'
+            ? "        transport http {\n            tls_insecure_skip_verify\n        }\n"
+            : '';
+
+        $caddyBlock = <<<CADDY
+# Managed by Vanill-IA OS — Route: {$fqdn} -> {$targetScheme}://{$targetHost}:{$targetPort}
+{$siteAddress} {
+{$tlsDirective}    encode zstd gzip
+    reverse_proxy {$targetScheme}://{$targetHost}:{$targetPort} {
+{$tlsSkipVerify}    }
+}
+CADDY;
+
+        $previousBackup = is_file($configPath) ? (string) file_get_contents($configPath) : null;
+        file_put_contents($configPath, $caddyBlock . "\n");
+        chmod($configPath, 0644);
+
+        // Validation Caddy avec rollback immédiat si la configuration est rejetée
+        $this->ensureCleanMainCaddyfile();
+        if ($this->commandExists('caddy') && is_file('/etc/caddy/Caddyfile')) {
+            $val = $this->runCommand(['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'], null, 15);
+            if ($val['exit_code'] !== 0) {
+                if ($previousBackup !== null) {
+                    file_put_contents($configPath, $previousBackup);
+                } else {
+                    @unlink($configPath);
+                }
+                throw new AgentError('CADDY_VALIDATE_FAILED', 'Validation Caddy échouée : ' . trim($val['stderr'] ?: $val['stdout']));
+            }
+            $this->runCommand(['systemctl', 'reload', 'caddy'], null, 15);
+        }
+
+        $pdo = $this->openDatabase();
+        $stmt = $pdo->prepare(
+            'INSERT INTO proxy_routes (slug, fqdn, target_host, target_port, target_scheme, tls_mode, container_name, config_path, enabled, updated_at)
+             VALUES (:slug, :fqdn, :target_host, :target_port, :target_scheme, :tls_mode, :container_name, :config_path, 1, :updated_at)
+             ON CONFLICT(slug) DO UPDATE SET
+                fqdn = excluded.fqdn,
+                target_host = excluded.target_host,
+                target_port = excluded.target_port,
+                target_scheme = excluded.target_scheme,
+                tls_mode = excluded.tls_mode,
+                container_name = excluded.container_name,
+                config_path = excluded.config_path,
+                enabled = 1,
+                updated_at = excluded.updated_at'
+        );
+        $stmt->execute([
+            ':slug'           => $slug,
+            ':fqdn'           => $fqdn,
+            ':target_host'    => $targetHost,
+            ':target_port'    => $targetPort,
+            ':target_scheme'  => $targetScheme,
+            ':tls_mode'       => $tlsMode,
+            ':container_name' => $containerName ?: null,
+            ':config_path'    => $configPath,
+            ':updated_at'     => gmdate('Y-m-d H:i:s'),
+        ]);
+
+        return $this->handleCaddyProxyList();
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleCaddyProxyDelete(array $params): array
+    {
+        $id = (int) ($params['id'] ?? 0);
+        if ($id <= 0) {
+            throw new AgentError('INVALID_ROUTE_ID', 'Identifiant de route proxy invalide.');
+        }
+
+        $pdo = $this->openDatabase();
+        $stmt = $pdo->prepare('SELECT * FROM proxy_routes WHERE id = :id LIMIT 1');
+        $stmt->execute([':id' => $id]);
+        $route = $stmt->fetch();
+
+        if ($route === false) {
+            throw new AgentError('ROUTE_NOT_FOUND', 'Route reverse proxy introuvable.', 404);
+        }
+
+        $configPath = (string) $route['config_path'];
+        if (str_starts_with($configPath, self::CADDY_CONF_DIR . '/app-') && is_file($configPath)) {
+            @unlink($configPath);
+        }
+
+        $del = $pdo->prepare('DELETE FROM proxy_routes WHERE id = :id');
+        $del->execute([':id' => $id]);
+
+        if ($this->commandExists('caddy')) {
+            $this->runCommand(['systemctl', 'reload', 'caddy'], null, 15);
+        }
+
+        return $this->handleCaddyProxyList();
+    }
+
+    /**
+     * Isolation Réseau du WebOS (LAN / Tailscale / All) dans /etc/caddy/conf.d/vanill-ia-os.caddy
+     * tout en conservant systématiquement `import vanill-ia-browser` et en synchronisant
+     * dynamiquement le port HTTP local de `forward_auth` dans `vanill-ia-browser.caddy`.
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleCaddyExposureSave(array $params): array
+    {
+        $mode = (string) ($params['mode'] ?? 'all');
+        if (!in_array($mode, ['all', 'lan_tailscale', 'tailscale_only'], true)) {
+            throw new AgentError('INVALID_EXPOSURE_MODE', 'Mode attendu : all, lan_tailscale ou tailscale_only.');
+        }
+
+        $confFile = self::CADDY_CONF_DIR . '/vanill-ia-os.caddy';
+        $browserConfFile = self::CADDY_CONF_DIR . '/vanill-ia-browser.caddy';
+
+        $detected = $this->detectWebOsListeners();
+        $httpsListen = isset($params['https_port']) && (int) $params['https_port'] > 0
+            ? ':' . (int) $params['https_port']
+            : $detected['https_listen'];
+        $httpPort = isset($params['http_port']) && (int) $params['http_port'] > 0
+            ? (int) $params['http_port']
+            : $detected['http_port'];
+        $httpListen = isset($params['http_port']) && (int) $params['http_port'] > 0
+            ? ':' . $httpPort
+            : $detected['http_listen'];
+
+        $phpSock = $this->detectPhpFpmSocket();
+
+        $guardBlock = '';
+        if ($mode === 'lan_tailscale') {
+            $guardBlock = <<<'GUARD'
+    @blocked_external {
+        not remote_ip 127.0.0.0/8 ::1 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 fd7a:115c:a1e0::/48
+        not path /share.php
+    }
+    respond @blocked_external "Vanill-IA OS : Access restricted to private LAN or Tailscale." 403
+
+GUARD;
+        } elseif ($mode === 'tailscale_only') {
+            $guardBlock = <<<'GUARD'
+    @blocked_non_tailscale {
+        not remote_ip 127.0.0.0/8 ::1 100.64.0.0/10 fd7a:115c:a1e0::/48
+        not path /share.php
+    }
+    respond @blocked_non_tailscale "Vanill-IA OS : Access restricted exclusively to Tailscale VPN." 403
+
+GUARD;
+        }
+
+        $buildSite = static function (string $listen, bool $tlsInternal) use ($guardBlock, $phpSock): string {
+            $tlsLine = $tlsInternal ? "    tls internal\n" : '';
+            return <<<SITE
+{$listen} {
+{$tlsLine}    root * /usr/share/vanill-ia-os
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Service-Worker-Allowed "/"
+        -Server
+    }
+
+    @sw_no_cache path /sw.js /manifest.json
+    header @sw_no_cache Cache-Control "no-cache, must-revalidate"
+
+{$guardBlock}    import vanill-ia-browser
+
+    @forbidden {
+        path /config/* *.sql *.db *.db-wal *.db-shm /.*
+    }
+    respond @forbidden 403
+
+    php_fastcgi unix/{$phpSock} {
+        env VANILL_IA_ENV production
+    }
+
+    file_server
+}
+SITE;
+        };
+
+        $newContent = "# Managed by Vanill-IA OS — Network Exposure Mode: {$mode}\n\n"
+            . $buildSite($httpsListen, true) . "\n\n"
+            . $buildSite($httpListen, false) . "\n";
+
+        $backupMain = is_file($confFile) ? (string) file_get_contents($confFile) : null;
+        $backupBrowser = is_file($browserConfFile) ? (string) file_get_contents($browserConfFile) : null;
+
+        file_put_contents($confFile, $newContent);
+        chmod($confFile, 0644);
+        $this->writeBrowserCaddySnippet($httpPort);
+        $this->ensureCleanMainCaddyfile();
+
+        if ($this->commandExists('caddy') && is_file('/etc/caddy/Caddyfile')) {
+            $val = $this->runCommand(['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'], null, 15);
+            if ($val['exit_code'] !== 0) {
+                if ($backupMain !== null) {
+                    file_put_contents($confFile, $backupMain);
+                }
+                if ($backupBrowser !== null) {
+                    file_put_contents($browserConfFile, $backupBrowser);
+                }
+                throw new AgentError('CADDY_VALIDATE_FAILED', 'Validation Caddy échouée : ' . trim($val['stderr'] ?: $val['stdout']));
+            }
+            $this->runCommand(['systemctl', 'reload', 'caddy'], null, 15);
+        }
+
+        $pdo = $this->openDatabase();
+        $stmt = $pdo->prepare("INSERT INTO settings (key, value, category, updated_at) VALUES ('security.network_exposure', :v, 'security', :u) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at");
+        $stmt->execute([':v' => $mode, ':u' => gmdate('Y-m-d H:i:s')]);
+
+        return ['saved' => true, 'exposure_mode' => $mode, 'http_port' => $httpPort];
+    }
+
+    /**
+     * Détecte dynamiquement le socket Unix PHP-FPM actif sur toute distribution Debian/Ubuntu.
+     */
+    private function detectPhpFpmSocket(): string
+    {
+        $sockets = glob('/run/php/php*-fpm.sock') ?: [];
+        if ($sockets !== []) {
+            rsort($sockets, SORT_NATURAL);
+            foreach ($sockets as $sock) {
+                if (file_exists($sock)) {
+                    return $sock;
+                }
+            }
+        }
+
+        foreach (['/run/php/php-fpm.sock', '/run/php-fpm/www.sock'] as $generic) {
+            if (file_exists($generic)) {
+                return $generic;
+            }
+        }
+
+        $svc = $this->detectPhpFpmService();
+        if (preg_match('/^php([0-9]+\.[0-9]+)-fpm$/', $svc)) {
+            return "/run/php/{$svc}.sock";
+        }
+
+        return '/run/php/php' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '-fpm.sock';
+    }
+
+    /**
+     * Détecte dynamiquement le nom du service systemd PHP-FPM actif ou installé.
+     */
+    private function detectPhpFpmService(): string
+    {
+        if ($this->commandExists('systemctl')) {
+            $res = $this->runCommand([
+                'systemctl', 'list-units', '--type=service', '--state=running', 'php*fpm*.service', '--no-legend', '--plain',
+            ], null, 4);
+            if ($res['exit_code'] === 0 && trim($res['stdout']) !== '') {
+                $firstCol = strtok(trim($res['stdout']), " \t\r\n");
+                if (is_string($firstCol) && $firstCol !== '') {
+                    return preg_replace('/\.service$/', '', $firstCol) ?: $firstCol;
+                }
+            }
+        }
+
+        $unitFiles = array_merge(
+            glob('/lib/systemd/system/php*-fpm.service') ?: [],
+            glob('/usr/lib/systemd/system/php*-fpm.service') ?: [],
+            glob('/lib/systemd/system/php-fpm.service') ?: [],
+            glob('/usr/lib/systemd/system/php-fpm.service') ?: []
+        );
+        if ($unitFiles !== []) {
+            rsort($unitFiles, SORT_NATURAL);
+            return basename($unitFiles[0], '.service');
+        }
+
+        return 'php' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION . '-fpm';
+    }
+
+    /**
+     * Détecte dynamiquement les ports HTTPS et HTTP locaux actifs dans `/etc/caddy/conf.d/vanill-ia-os.caddy`.
+     *
+     * @return array{https_listen: string, http_listen: string, http_port: int}
+     */
+    private function detectWebOsListeners(): array
+    {
+        $confFile = self::CADDY_CONF_DIR . '/vanill-ia-os.caddy';
+        $httpsListen = ':8443';
+        $httpListen = ':8080';
+        $httpPort = 8080;
+
+        if (is_readable($confFile)) {
+            $raw = (string) file_get_contents($confFile);
+            if (preg_match_all('/^([^\s{#][^{]*?)\s*\{([\s\S]*?)^\}/m', $raw, $matches, PREG_SET_ORDER)) {
+                foreach ($matches as $blk) {
+                    $addr = trim($blk[1]);
+                    $body = $blk[2];
+                    $hasTls = preg_match('/^\s*tls\s+/m', $body) === 1 || str_starts_with($addr, 'https://');
+                    if ($hasTls) {
+                        $httpsListen = $addr;
+                    } elseif (preg_match('/:([0-9]{2,5})\b/', $addr, $pm)) {
+                        $httpListen = $addr;
+                        $httpPort = (int) $pm[1];
+                    }
+                }
+            }
+        }
+
+        return [
+            'https_listen' => $httpsListen,
+            'http_listen'  => $httpListen,
+            'http_port'    => $httpPort,
+        ];
+    }
+
+    /**
+     * Écrit `/etc/caddy/conf.d/vanill-ia-browser.caddy` en alignant `forward_auth` sur le port HTTP actif.
+     */
+    private function writeBrowserCaddySnippet(int $httpPort): bool
+    {
+        if (!is_dir(self::CADDY_CONF_DIR)) {
+            return false;
+        }
+
+        $browserSnippet = self::CADDY_CONF_DIR . '/vanill-ia-browser.caddy';
+        $snippetContent = <<<CADDY
+# ==============================================================================
+# Vanill-IA OS — Dedicated Remote Browser Isolation Snippet (Persistent Route)
+# Protected by `forward_auth` against the active local HTTP listener (:{$httpPort}).
+# ==============================================================================
+
+(vanill-ia-browser) {
+    @browser_bare path /browser /browser/
+    redir @browser_bare /browser/vnc.html?autoconnect=true&resize=remote&path=browser/websockify 302
+
+    handle_path /browser/* {
+        forward_auth 127.0.0.1:{$httpPort} {
+            uri /api/auth-check.php
+            copy_headers X-Vanillia-User
+        }
+        reverse_proxy 127.0.0.1:6080
+    }
+}
+CADDY;
+        $desired = $snippetContent . "\n";
+        $current = is_file($browserSnippet) ? (string) file_get_contents($browserSnippet) : '';
+        if ($current === $desired) {
+            return false;
+        }
+
+        @file_put_contents($browserSnippet, $desired);
+        @chmod($browserSnippet, 0644);
+        return true;
+    }
+
+    /**
+     * Garantit que `/etc/caddy/Caddyfile` n'importe QUE `/etc/caddy/conf.d/*.caddy` (une seule fois,
+     * jamais `/etc/caddy/conf.d/*` qui inclurait les fichiers `.dpkg-dist` ou doublerait les snippets).
+     */
+    private function ensureCleanMainCaddyfile(): void
+    {
+        $mainFile = '/etc/caddy/Caddyfile';
+        if (!is_file($mainFile) || !is_writable($mainFile)) {
+            return;
+        }
+
+        $lines = file($mainFile, FILE_IGNORE_NEW_LINES) ?: [];
+        $out = [];
+        $seenImport = false;
+        $changed = false;
+
+        foreach ($lines as $line) {
+            if (preg_match('#^(\s*import\s+/etc/caddy/conf\.d/\*)\s*$#', $line, $m)) {
+                $line = $m[1] . '.caddy';
+                $changed = true;
+            }
+
+            if (preg_match('#^\s*import\s+/etc/caddy/conf\.d/\*\.caddy(\s|$)#', $line)) {
+                if ($seenImport) {
+                    $changed = true;
+                    continue;
+                }
+                $seenImport = true;
+            }
+            $out[] = $line;
+        }
+
+        if (!$seenImport) {
+            $out[] = '';
+            $out[] = '# Vanill-IA OS Managed Configurations';
+            $out[] = 'import /etc/caddy/conf.d/*.caddy';
+            $changed = true;
+        }
+
+        if ($changed) {
+            @file_put_contents($mainFile, implode("\n", $out) . "\n");
+            @chmod($mainFile, 0644);
+        }
+    }
+
+    // ==========================================================================
+    // 7. PLANIFICATEUR DE TÂCHES CRON (/etc/cron.d/vanill-ia)
+    // ==========================================================================
+
+    /**
+     * Synchronise les tâches actives de SQLite vers /etc/cron.d/vanill-ia
+     *
+     * @return array<string, mixed>
+     */
+    private function handleCronSync(): array
+    {
+        $pdo = $this->openDatabase();
+        $jobs = $pdo->query('SELECT id, title, schedule, run_user, enabled FROM cron_jobs WHERE enabled = 1 ORDER BY id ASC')->fetchAll();
+
+        $lines = [
+            '# /etc/cron.d/vanill-ia — Managed automatically by Vanill-IA OS',
+            '# Do not edit manually; changes will be overwritten by Cron Manager.',
+            'SHELL=/bin/bash',
+            'PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin',
+            '',
+        ];
+
+        $syncedCount = 0;
+        foreach ($jobs as $job) {
+            $jobId = (int) $job['id'];
+            $schedule = trim((string) $job['schedule']);
+            $runUser = trim((string) $job['run_user']);
+
+            if (!$this->isValidCronSchedule($schedule)) {
+                throw new AgentError('INVALID_CRON_EXPR', "Expression cron invalide sur la tâche #{$jobId} : {$schedule}");
+            }
+            if (preg_match('/^[a-z_][a-z0-9_-]{0,31}$/', $runUser) !== 1 || posix_getpwnam($runUser) === false) {
+                throw new AgentError('INVALID_CRON_USER', "Utilisateur système introuvable pour la tâche #{$jobId} : {$runUser}");
+            }
+
+            $safeTitle = preg_replace('/[^\PC\s]/u', '', (string) $job['title']);
+            $lines[] = "# Task #{$jobId}: {$safeTitle}";
+            $lines[] = sprintf('%s %s /usr/local/bin/vanill-ia-cron-run %d >/dev/null 2>&1', $schedule, $runUser, $jobId);
+            $syncedCount++;
+        }
+
+        $lines[] = '';
+        $tmpFile = self::CRON_FILE . '.tmp';
+        file_put_contents($tmpFile, implode("\n", $lines));
+        chown($tmpFile, 'root');
+        chgrp($tmpFile, 'root');
+        chmod($tmpFile, 0644);
+        rename($tmpFile, self::CRON_FILE);
+
+        return [
+            'synced'      => true,
+            'active_jobs' => $syncedCount,
+            'cron_file'   => self::CRON_FILE,
+        ];
+    }
+
+    private function isValidCronSchedule(string $expr): bool
+    {
+        if (in_array($expr, ['@reboot', '@yearly', '@annually', '@monthly', '@weekly', '@daily', '@midnight', '@hourly'], true)) {
+            return true;
+        }
+        $parts = preg_split('/\s+/', $expr) ?: [];
+        if (count($parts) !== 5) {
+            return false;
+        }
+        foreach ($parts as $part) {
+            if (preg_match('#^[0-9*,/-]+$#', $part) !== 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Exécution immédiate ("Exécuter maintenant") via le wrapper vanill-ia-cron-run
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleCronRun(array $params): array
+    {
+        $jobId = (int) ($params['job_id'] ?? 0);
+        if ($jobId <= 0) {
+            throw new AgentError('INVALID_JOB_ID', 'Identifiant de tâche cron invalide.');
+        }
+
+        $async = (bool) ($params['async'] ?? false);
+        if ($async) {
+            exec(sprintf('nohup /usr/bin/php /usr/local/bin/vanill-ia-cron-run %d --manual >/dev/null 2>&1 &', $jobId));
+            return ['started' => true, 'async' => true, 'job_id' => $jobId];
+        }
+
+        $res = $this->runCommand(['/usr/bin/php', '/usr/local/bin/vanill-ia-cron-run', (string) $jobId, '--manual'], null, 120);
+
+        $pdo = $this->openDatabase();
+        $stmt = $pdo->prepare('SELECT * FROM cron_jobs WHERE id = :id LIMIT 1');
+        $stmt->execute([':id' => $jobId]);
+        $updatedJob = $stmt->fetch();
+
+        return [
+            'started'   => true,
+            'async'     => false,
+            'exit_code' => $res['exit_code'],
+            'job'       => $updatedJob ?: null,
+        ];
+    }
+
+    /**
+     * Liste des comptes utilisateurs valides pouvant exécuter une tâche Cron
+     *
+     * @return array<string, mixed>
+     */
+    private function handleSystemUsersList(): array
+    {
+        $users = [];
+        if (is_readable('/etc/passwd')) {
+            $lines = file('/etc/passwd', FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [];
+            foreach ($lines as $line) {
+                $cols = explode(':', $line);
+                if (count($cols) < 7) {
+                    continue;
+                }
+                $name = $cols[0];
+                $uid = (int) $cols[2];
+                $shell = $cols[6];
+                if ($name === 'root' || $name === 'www-data' || ($uid >= 1000 && $uid < 65534 && !str_ends_with($shell, 'nologin') && !str_ends_with($shell, 'false'))) {
+                    $users[] = [
+                        'username' => $name,
+                        'uid'      => $uid,
+                        'home'     => $cols[5],
+                        'shell'    => $shell,
+                    ];
+                }
+            }
+        }
+        return ['users' => $users];
+    }
+
+    // ==========================================================================
+    // 8. OPÉRATIONS FICHIERS PRIVILÉGIÉES (FILE STATION CHMOD / CHOWN)
+    // ==========================================================================
+
+    private function validateSafeFsPath(string $path): string
+    {
+        $real = realpath($path);
+        if ($real === false) {
+            throw new AgentError('PATH_NOT_FOUND', 'Chemin introuvable sur le système de fichiers.', 404);
+        }
+
+        $forbiddenExact = [
+            '/',
+            '/etc/shadow',
+            '/etc/gshadow',
+            '/etc/passwd',
+            '/etc/sudoers',
+            '/usr/local/bin/vanill-ia-agent',
+            '/usr/local/bin/vanill-ia-cron-run',
+        ];
+        if (in_array($real, $forbiddenExact, true) || str_starts_with($real, '/proc/') || str_starts_with($real, '/sys/') || str_starts_with($real, '/dev/')) {
+            throw new AgentError('PROTECTED_PATH', 'Modification des permissions interdite sur ce chemin système critique.', 403);
+        }
+
+        return $real;
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsChmod(array $params): array
+    {
+        $path = $this->validateSafeFsPath((string) ($params['path'] ?? ''));
+        $modeStr = trim((string) ($params['mode'] ?? ''));
+        $recursive = (bool) ($params['recursive'] ?? false);
+
+        if (preg_match('/^[0-7]{3,4}$/', $modeStr) !== 1) {
+            throw new AgentError('INVALID_MODE', 'Mode octal invalide (ex: 0755 ou 644).');
+        }
+
+        $cmd = $recursive ? ['chmod', '-R', $modeStr, $path] : ['chmod', $modeStr, $path];
+        $res = $this->runCommand($cmd, null, 20);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('CHMOD_FAILED', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        return ['updated' => true, 'path' => $path, 'mode' => $modeStr];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsChown(array $params): array
+    {
+        $path = $this->validateSafeFsPath((string) ($params['path'] ?? ''));
+        $owner = trim((string) ($params['owner'] ?? ''));
+        $group = trim((string) ($params['group'] ?? ''));
+        $recursive = (bool) ($params['recursive'] ?? false);
+
+        if (preg_match('/^[a-z_][a-z0-9_-]{0,31}$/', $owner) !== 1) {
+            throw new AgentError('INVALID_OWNER', 'Propriétaire système invalide.');
+        }
+        if ($group !== '' && preg_match('/^[a-z_][a-z0-9_-]{0,31}$/', $group) !== 1) {
+            throw new AgentError('INVALID_GROUP', 'Groupe système invalide.');
+        }
+
+        $spec = $group !== '' ? "{$owner}:{$group}" : $owner;
+        $cmd = $recursive ? ['chown', '-R', $spec, $path] : ['chown', $spec, $path];
+        $res = $this->runCommand($cmd, null, 20);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('CHOWN_FAILED', trim($res['stderr'] ?: $res['stdout']));
+        }
+
+        return ['updated' => true, 'path' => $path, 'ownership' => $spec];
+    }
+
+    /**
+     * Vérifie qu'un chemin absolu normalisé ne cible pas un secret système critique.
+     */
+    private function assertNonSecretPath(string $path, bool $mustExist = true): string
+    {
+        $path = trim($path);
+        if ($path === '' || !str_starts_with($path, '/')) {
+            throw new AgentError('INVALID_PATH', 'Chemin absolu requis (commençant par /).');
+        }
+
+        if ($mustExist) {
+            $real = realpath($path);
+            if ($real === false) {
+                throw new AgentError('PATH_NOT_FOUND', "Chemin introuvable : {$path}", 404);
+            }
+        } else {
+            $parent = realpath(dirname($path));
+            if ($parent === false) {
+                throw new AgentError('PARENT_NOT_FOUND', 'Dossier parent introuvable : ' . dirname($path), 404);
+            }
+            $base = basename($path);
+            if ($base === '' || $base === '.' || $base === '..' || str_contains($base, '/')) {
+                throw new AgentError('INVALID_BASENAME', 'Nom de fichier ou dossier invalide.');
+            }
+            $real = rtrim($parent, '/') . '/' . $base;
+        }
+
+        $blockedExact = [
+            '/etc/shadow',
+            '/etc/shadow-',
+            '/etc/gshadow',
+            '/etc/gshadow-',
+            '/var/lib/vanill-ia-os/data/.secret.key',
+            '/var/lib/vanill-ia-os/data/setup.token',
+        ];
+
+        if (in_array($real, $blockedExact, true)) {
+            throw new AgentError('SECRET_PATH_FORBIDDEN', 'Accès refusé à ce fichier secret.', 403);
+        }
+
+        return $real;
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsList(array $params): array
+    {
+        $dir = $this->assertNonSecretPath((string) ($params['path'] ?? '/'), true);
+        if (!is_dir($dir)) {
+            throw new AgentError('NOT_A_DIRECTORY', 'Le chemin spécifié n\'est pas un dossier.');
+        }
+
+        $showHidden = !empty($params['show_hidden']);
+        $entries = @scandir($dir);
+        if ($entries === false) {
+            throw new AgentError('READDIR_FAILED', "Impossible de lire le dossier {$dir}.");
+        }
+
+        $items = [];
+        foreach ($entries as $name) {
+            if ($name === '.' || $name === '..') {
+                continue;
+            }
+            if (!$showHidden && str_starts_with($name, '.') && $name !== '.env' && $name !== '.htaccess') {
+                continue;
+            }
+
+            $full = rtrim($dir, '/') . '/' . $name;
+            $stat = @lstat($full);
+            $isDir = is_dir($full);
+            $isLink = is_link($full);
+            $perms = $stat !== false ? substr(sprintf('%o', $stat['mode']), -4) : '0000';
+            $uid = $stat !== false ? $stat['uid'] : 0;
+            $gid = $stat !== false ? $stat['gid'] : 0;
+            $pw = function_exists('posix_getpwuid') ? @posix_getpwuid($uid) : false;
+            $gr = function_exists('posix_getgrgid') ? @posix_getgrgid($gid) : false;
+
+            $items[] = [
+                'name'       => $name,
+                'path'       => $full,
+                'is_dir'     => $isDir,
+                'is_symlink' => $isLink,
+                'size'       => $isDir ? 0 : (int) ($stat['size'] ?? 0),
+                'mtime'      => (int) ($stat['mtime'] ?? 0),
+                'mode'       => $perms,
+                'owner'      => is_array($pw) ? $pw['name'] : (string) $uid,
+                'group'      => is_array($gr) ? $gr['name'] : (string) $gid,
+                'extension'  => $isDir ? '' : strtolower(pathinfo($name, PATHINFO_EXTENSION)),
+            ];
+        }
+
+        usort($items, static function (array $a, array $b): int {
+            if ($a['is_dir'] !== $b['is_dir']) {
+                return $a['is_dir'] ? -1 : 1;
+            }
+            return strnatcasecmp($a['name'], $b['name']);
+        });
+
+        return [
+            'path'   => $dir,
+            'parent' => $dir === '/' ? null : dirname($dir),
+            'items'  => $items,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsRead(array $params): array
+    {
+        $file = $this->assertNonSecretPath((string) ($params['path'] ?? ''), true);
+        if (!is_file($file)) {
+            throw new AgentError('NOT_A_FILE', 'Ce chemin n\'est pas un fichier régulier.');
+        }
+
+        $maxSize = max(1024, min(1_572_864, (int) ($params['max_bytes'] ?? 1_048_576))); // 1 Mo max en édition texte
+        $size = (int) filesize($file);
+        if ($size > $maxSize) {
+            throw new AgentError('FILE_TOO_LARGE', sprintf('Fichier trop volumineux (%d octets) pour l\'éditeur texte.', $size));
+        }
+
+        $raw = (string) file_get_contents($file);
+        $asBase64 = !empty($params['base64']);
+
+        return [
+            'path'    => $file,
+            'size'    => $size,
+            'mtime'   => (int) filemtime($file),
+            'content' => $asBase64 ? base64_encode($raw) : $raw,
+            'base64'  => $asBase64,
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsWrite(array $params): array
+    {
+        $file = $this->assertNonSecretPath((string) ($params['path'] ?? ''), false);
+        if (in_array($file, ['/usr/local/bin/vanill-ia-agent', '/usr/local/bin/vanill-ia-cron-run', '/etc/sudoers'], true)) {
+            throw new AgentError('PROTECTED_PATH', 'Écriture directe interdite sur ce fichier système protégé.', 403);
+        }
+
+        $content = (string) ($params['content'] ?? '');
+        if (!empty($params['base64'])) {
+            $decoded = base64_decode($content, true);
+            if ($decoded === false) {
+                throw new AgentError('INVALID_BASE64', 'Contenu Base64 invalide.');
+            }
+            $content = $decoded;
+        }
+
+        if (file_put_contents($file, $content) === false) {
+            throw new AgentError('WRITE_FAILED', "Impossible d'écrire dans {$file}.", 500);
+        }
+
+        return [
+            'saved' => true,
+            'path'  => $file,
+            'size'  => strlen($content),
+        ];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsMkdir(array $params): array
+    {
+        $dir = $this->assertNonSecretPath((string) ($params['path'] ?? ''), false);
+        if (file_exists($dir)) {
+            throw new AgentError('ALREADY_EXISTS', 'Un fichier ou dossier porte déjà ce nom.');
+        }
+        if (!mkdir($dir, 0755, false)) {
+            throw new AgentError('MKDIR_FAILED', "Impossible de créer le dossier {$dir}.");
+        }
+        return ['created' => true, 'path' => $dir];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsRename(array $params): array
+    {
+        $from = $this->assertNonSecretPath((string) ($params['from'] ?? ''), true);
+        $to = $this->assertNonSecretPath((string) ($params['to'] ?? ''), false);
+
+        if ($from === '/' || in_array($from, ['/etc', '/usr', '/var', '/bin', '/sbin', '/root', '/home', '/mnt', '/opt'], true)) {
+            throw new AgentError('PROTECTED_PATH', 'Impossible de renommer un dossier racine système.', 403);
+        }
+        if (!@rename($from, $to)) {
+            throw new AgentError('RENAME_FAILED', 'Échec du renommage / déplacement.');
+        }
+        return ['renamed' => true, 'from' => $from, 'to' => $to];
+    }
+
+    /**
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsDelete(array $params): array
+    {
+        $target = $this->assertNonSecretPath((string) ($params['path'] ?? ''), true);
+        $protected = ['/', '/bin', '/boot', '/dev', '/etc', '/home', '/lib', '/lib64', '/mnt', '/opt', '/proc', '/root', '/run', '/sbin', '/srv', '/sys', '/tmp', '/usr', '/var', '/var/lib/vanill-ia-os', '/usr/share/vanill-ia-os'];
+
+        if (in_array($target, $protected, true)) {
+            throw new AgentError('PROTECTED_PATH', 'Suppression interdite sur cette arborescence système critique.', 403);
+        }
+
+        $res = $this->runCommand(['rm', '-rf', '--preserve-root', $target], null, 30);
+        if ($res['exit_code'] !== 0) {
+            throw new AgentError('DELETE_FAILED', trim($res['stderr'] ?: $res['stdout']));
+        }
+        return ['deleted' => true, 'path' => $target];
+    }
+
+    /**
+     * Compression / Extraction d'archives .zip
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsArchive(array $params): array
+    {
+        $mode = (string) ($params['mode'] ?? 'zip');
+        if ($mode === 'zip') {
+            $source = $this->assertNonSecretPath((string) ($params['source'] ?? ''), true);
+            $dest = $this->assertNonSecretPath((string) ($params['destination'] ?? ($source . '.zip')), false);
+            if (!str_ends_with(strtolower($dest), '.zip')) {
+                $dest .= '.zip';
+            }
+
+            if (class_exists('ZipArchive')) {
+                $zip = new ZipArchive();
+                if ($zip->open($dest, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+                    throw new AgentError('ZIP_OPEN_FAILED', 'Impossible de créer l\'archive ZIP.');
+                }
+                if (is_file($source)) {
+                    $zip->addFile($source, basename($source));
+                } else {
+                    $it = new RecursiveIteratorIterator(
+                        new RecursiveDirectoryIterator($source, FilesystemIterator::SKIP_DOTS),
+                        RecursiveIteratorIterator::SELF_FIRST
+                    );
+                    $prefixLen = strlen(dirname($source)) + 1;
+                    foreach ($it as $item) {
+                        $itemPath = $item->getPathname();
+                        $localName = substr($itemPath, $prefixLen);
+                        if ($item->isDir()) {
+                            $zip->addEmptyDir($localName);
+                        } elseif ($item->isFile()) {
+                            $zip->addFile($itemPath, $localName);
+                        }
+                    }
+                }
+                $zip->close();
+                return ['archived' => true, 'destination' => $dest];
+            }
+
+            $res = $this->runCommand(['zip', '-r', $dest, basename($source)], dirname($source), 60);
+            if ($res['exit_code'] !== 0) {
+                throw new AgentError('ZIP_FAILED', trim($res['stderr'] ?: $res['stdout']));
+            }
+            return ['archived' => true, 'destination' => $dest];
+        }
+
+        if ($mode === 'unzip') {
+            $archive = $this->assertNonSecretPath((string) ($params['source'] ?? ''), true);
+            $destDir = $this->assertNonSecretPath((string) ($params['destination'] ?? dirname($archive)), true);
+
+            if (class_exists('ZipArchive')) {
+                $zip = new ZipArchive();
+                if ($zip->open($archive) !== true) {
+                    throw new AgentError('UNZIP_OPEN_FAILED', 'Impossible d\'ouvrir l\'archive ZIP.');
+                }
+                // Vérification anti Zip-Slip
+                for ($i = 0; $i < $zip->numFiles; $i++) {
+                    $entryName = (string) $zip->getNameIndex($i);
+                    if (str_contains($entryName, '..') || str_starts_with($entryName, '/')) {
+                        $zip->close();
+                        throw new AgentError('ZIP_SLIP_DETECTED', 'Archive rejetée : chemins relatifs dangereux détectés.', 400);
+                    }
+                }
+                $zip->extractTo($destDir);
+                $zip->close();
+                return ['extracted' => true, 'destination' => $destDir];
+            }
+
+            $res = $this->runCommand(['unzip', '-o', $archive, '-d', $destDir], null, 60);
+            if ($res['exit_code'] !== 0) {
+                throw new AgentError('UNZIP_FAILED', trim($res['stderr'] ?: $res['stdout']));
+            }
+            return ['extracted' => true, 'destination' => $destDir];
+        }
+
+        throw new AgentError('INVALID_ARCHIVE_MODE', 'Mode attendu : zip ou unzip.');
+    }
+
+    /**
+     * Valide et résout canoniquement (`realpath`) un fichier éligible au partage public `/share.php`.
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsStatShare(array $params): array
+    {
+        $real = $this->assertNonSecretPath((string) ($params['path'] ?? ''), true);
+        if (str_starts_with($real, '/var/lib/vanill-ia-os/data/') || str_starts_with($real, '/proc/') || str_starts_with($real, '/sys/') || str_starts_with($real, '/dev/')) {
+            throw new AgentError('SECRET_PATH_FORBIDDEN', 'System database and virtual kernel files cannot be shared publicly.', 403);
+        }
+        if (!is_file($real) || !is_readable($real)) {
+            throw new AgentError('NOT_A_REGULAR_FILE', 'Target path is not a readable regular file.', 400);
+        }
+
+        return [
+            'real_path' => $real,
+            'file_name' => basename($real),
+            'file_size' => (int) filesize($real),
+        ];
+    }
+
+    /**
+     * Lit un bloc binaire borné d'un fichier partagé non directement lisible par `www-data` (ex: dans `/root`).
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleFsReadChunk(array $params): array
+    {
+        $real = $this->assertNonSecretPath((string) ($params['path'] ?? ''), true);
+        if (!is_file($real)) {
+            throw new AgentError('NOT_A_FILE', 'File no longer exists.', 404);
+        }
+        $offset = max(0, (int) ($params['offset'] ?? 0));
+        $length = max(4096, min(524288, (int) ($params['length'] ?? 262144))); // 256 Ko par bloc
+
+        $fp = @fopen($real, 'rb');
+        if ($fp === false) {
+            throw new AgentError('OPEN_FAILED', 'Unable to open file.', 500);
+        }
+        if ($offset > 0) {
+            fseek($fp, $offset);
+        }
+        $chunk = fread($fp, $length);
+        $eof = feof($fp);
+        fclose($fp);
+
+        return [
+            'chunk_b64' => base64_encode($chunk === false ? '' : $chunk),
+            'bytes'     => $chunk === false ? 0 : strlen($chunk),
+            'eof'       => $eof,
+        ];
+    }
+
+    /**
+     * Exécution interactive de commande pour le Terminal Web (avec persistance du répertoire courant)
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleShellExec(array $params): array
+    {
+        $command = trim((string) ($params['command'] ?? ''));
+        $cwd = trim((string) ($params['cwd'] ?? '/root')) ?: '/root';
+        if (!is_dir($cwd)) {
+            $cwd = '/root';
+        }
+
+        $marker = '__VANILLIA_PWD_' . bin2hex(random_bytes(4)) . '__';
+        $wrapped = $command === ''
+            ? "pwd"
+            : sprintf('%s ; __ec=$?; printf "\n%s%%s\n" "$(pwd)"; exit $__ec', $command, $marker);
+
+        $res = $this->runCommand(['/bin/bash', '-c', $wrapped], $cwd, 180, [
+            'TERM'            => 'xterm-256color',
+            'DEBIAN_FRONTEND' => 'noninteractive',
+        ]);
+
+        $newCwd = $cwd;
+        $stdout = $res['stdout'];
+        if (($pos = strrpos($stdout, $marker)) !== false) {
+            $after = trim(substr($stdout, $pos + strlen($marker)));
+            if ($after !== '' && str_starts_with($after, '/')) {
+                $newCwd = strtok($after, "\r\n") ?: $cwd;
+            }
+            $stdout = rtrim(substr($stdout, 0, $pos), "\r\n");
+        }
+
+        return [
+            'exit_code' => $res['exit_code'],
+            'stdout'    => $stdout,
+            'stderr'    => $res['stderr'],
+            'cwd'       => $newCwd,
+            'hostname'  => gethostname() ?: 'debian',
+            'ttyd_open' => $this->isPortListening(7681),
+        ];
+    }
+
+    private function isPortListening(int $port): bool
+    {
+        $fp = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.25);
+        if ($fp !== false) {
+            fclose($fp);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Pilote `/usr/local/bin/vanill-ia-browser-ctl` (`start`, `stop`, `status`).
+     *
+     * @param array<string, mixed> $params
+     * @return array<string, mixed>
+     */
+    private function handleBrowserControl(string $subcommand, array $params = []): array
+    {
+        if (!in_array($subcommand, ['start', 'stop', 'status'], true)) {
+            throw new AgentError('INVALID_BROWSER_CMD', 'Allowed commands: start, stop, status.');
+        }
+
+        $ctl = '/usr/local/bin/vanill-ia-browser-ctl';
+        if (!is_file($ctl) || !is_executable($ctl)) {
+            throw new AgentError('BROWSER_CTL_MISSING', 'Helper /usr/local/bin/vanill-ia-browser-ctl not found.', 500);
+        }
+
+        $cmdArgs = [$ctl, $subcommand];
+        if ($subcommand === 'start' && !empty($params['url']) && is_string($params['url'])) {
+            $candidateUrl = trim($params['url']);
+            $scheme = strtolower((string) parse_url($candidateUrl, PHP_URL_SCHEME));
+            if (filter_var($candidateUrl, FILTER_VALIDATE_URL) !== false && in_array($scheme, ['http', 'https'], true)) {
+                $cmdArgs[] = $candidateUrl;
+            }
+        }
+
+        // Synchronise dynamiquement le snippet Caddy (port HTTP local actif) avant de démarrer
+        if ($subcommand === 'start') {
+            $listeners = $this->detectWebOsListeners();
+            $snippetUpdated = $this->writeBrowserCaddySnippet($listeners['http_port']);
+            $this->ensureCleanMainCaddyfile();
+            if ($snippetUpdated && $this->commandExists('caddy') && is_file('/etc/caddy/Caddyfile')) {
+                $val = $this->runCommand(['caddy', 'validate', '--config', '/etc/caddy/Caddyfile', '--adapter', 'caddyfile'], null, 10);
+                if ($val['exit_code'] === 0) {
+                    $this->runCommand(['systemctl', 'reload', 'caddy'], null, 10);
+                }
+            }
+        }
+
+        $res = $this->runCommand($cmdArgs, null, 30);
+        if ($res['exit_code'] !== 0) {
+            $errMsg = trim($res['stderr'] ?: $res['stdout'] ?: 'Remote browser operation failed.');
+            $code = $res['exit_code'] === 12 ? 'BROWSER_DEPS_MISSING' : 'BROWSER_START_FAILED';
+            throw new AgentError($code, $errMsg, $res['exit_code'] === 12 ? 424 : 500);
+        }
+
+        $decoded = json_decode(trim($res['stdout']), true);
+        if (!is_array($decoded)) {
+            return ['running' => $subcommand === 'start', 'raw' => trim($res['stdout'])];
+        }
+
+        $missingStr = trim((string) ($decoded['missing_packages'] ?? ''));
+        $decoded['missing_list'] = $missingStr !== '' ? preg_split('/\s+/', $missingStr) : [];
+        return $decoded;
+    }
+}
+
+try {
+    $daemon = new VanillIAAgent();
+    $daemon->run();
+} catch (Throwable $fatal) {
+    fwrite(STDERR, sprintf("[FATAL] %s (%s:%d)\n", $fatal->getMessage(), $fatal->getFile(), $fatal->getLine()));
+    exit(1);
+}

@@ -1,0 +1,97 @@
+{
+  "id": "/",
+  "name": "Vanill-IA OS",
+  "short_name": "Vanill-IA OS",
+  "description": "Self-hosted WebOS for Debian 12/13 server administration, Docker stacks, Caddy reverse proxy and native SysAdmin AI.",
+  "lang": "en",
+  "dir": "ltr",
+  "start_url": "/?source=pwa",
+  "scope": "/",
+  "display": "standalone",
+  "display_override": [
+    "window-controls-overlay",
+    "standalone"
+  ],
+  "orientation": "any",
+  "background_color": "#0F1115",
+  "theme_color": "#0F1115",
+  "categories": [
+    "utilities",
+    "productivity",
+    "developer tools"
+  ],
+  "icons": [
+    {
+      "src": "/assets/img/pwa/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/img/pwa/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/assets/img/pwa/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ],
+  "shortcuts": [
+    {
+      "name": "Docker & Apps",
+      "short_name": "Docker",
+      "description": "Manage containers, Compose stacks and Reverse Proxy",
+      "url": "/?launch=docker-manager",
+      "icons": [
+        {
+          "src": "/assets/img/pwa/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Files",
+      "short_name": "Files",
+      "description": "Browse server files, archives and media",
+      "url": "/?launch=file-station",
+      "icons": [
+        {
+          "src": "/assets/img/pwa/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Vanill-IA Assistant",
+      "short_name": "Vanill-IA",
+      "description": "LLM chat and contextual SysAdmin diagnostics",
+      "url": "/?launch=vanill-ia-chat",
+      "icons": [
+        {
+          "src": "/assets/img/pwa/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    },
+    {
+      "name": "Terminal",
+      "short_name": "Terminal",
+      "description": "Interactive Debian shell access",
+      "url": "/?launch=terminal",
+      "icons": [
+        {
+          "src": "/assets/img/pwa/icon-192.png",
+          "sizes": "192x192",
+          "type": "image/png"
+        }
+      ]
+    }
+  ]
+}

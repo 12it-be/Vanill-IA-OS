@@ -1,0 +1,122 @@
+[
+  {
+    "slug": "ollama",
+    "name": "Ollama",
+    "category": "Intelligence Artificielle",
+    "tagline": "Serveur LLM local ultra-rapide connecté nativement à Vanill-IA OS",
+    "description": "Exécutez Qwen 2.5 Coder, Llama 3, Mistral ou DeepSeek localement sur votre serveur Debian et reliez-le sans clé API au module Vanill-IA.",
+    "icon": "sparkles",
+    "accent_color": "#FF6D5A",
+    "default_port": 11434,
+    "internal_port": 11434,
+    "compose_yml": "services:\n  ollama:\n    image: ollama/ollama:latest\n    container_name: ollama\n    restart: unless-stopped\n    ports:\n      - \"${APP_PORT:-11434}:11434\"\n    volumes:\n      - ./data:/root/.ollama\n"
+  },
+  {
+    "slug": "jellyfin",
+    "name": "Jellyfin",
+    "category": "Multimédia",
+    "tagline": "Serveur de streaming multimédia 100 % libre (films, séries, musique)",
+    "description": "Alternative open-source complète à Plex et Emby sans abonnement ni télémétrie.",
+    "icon": "layers",
+    "accent_color": "#8B5CF6",
+    "default_port": 8096,
+    "internal_port": 8096,
+    "compose_yml": "services:\n  jellyfin:\n    image: jellyfin/jellyfin:latest\n    container_name: jellyfin\n    restart: unless-stopped\n    ports:\n      - \"${APP_PORT:-8096}:8096\"\n    volumes:\n      - ./config:/config\n      - ./cache:/cache\n      - /mnt:/media\n"
+  },
+  {
+    "slug": "vaultwarden",
+    "name": "Vaultwarden",
+    "category": "Sécurité",
+    "tagline": "Coffre-fort de mots de passe compatible clients officiels Bitwarden",
+    "description": "Implémentation Rust ultra-légère de Bitwarden Server consommant moins de 30 Mo de RAM.",
+    "icon": "sliders",
+    "accent_color": "#2563EB",
+    "default_port": 8222,
+    "internal_port": 80,
+    "compose_yml": "services:\n  vaultwarden:\n    image: vaultwarden/server:latest\n    container_name: vaultwarden\n    restart: unless-stopped\n    environment:\n      DOMAIN: \"${VW_DOMAIN:-https://localhost}\"\n      SIGNUPS_ALLOWED: \"true\"\n    ports:\n      - \"${APP_PORT:-8222}:80\"\n    volumes:\n      - ./data:/data\n"
+  },
+  {
+    "slug": "n8n",
+    "name": "n8n",
+    "category": "Automatisation & IA",
+    "tagline": "Orchestrateur visuel de workflows et d'agents IA auto-hébergé",
+    "description": "Automatisez vos API, webhooks, bases de données et agents LLM avec plus de 400 intégrations.",
+    "icon": "activity",
+    "accent_color": "#EA580C",
+    "default_port": 5678,
+    "internal_port": 5678,
+    "compose_yml": "services:\n  n8n:\n    image: docker.n8n.io/n8nio/n8n:latest\n    container_name: n8n\n    restart: unless-stopped\n    environment:\n      GENERIC_TIMEZONE: \"Europe/Brussels\"\n      TZ: \"Europe/Brussels\"\n      N8N_SECURE_COOKIE: \"false\"\n    ports:\n      - \"${APP_PORT:-5678}:5678\"\n    volumes:\n      - ./data:/home/node/.n8n\n"
+  },
+  {
+    "slug": "gitea",
+    "name": "Gitea",
+    "category": "Développement",
+    "tagline": "Forge Git auto-hébergée légère avec CI/CD Gitea Actions",
+    "description": "Hébergez vos dépôts Git privés, issues, pull requests et pipelines CI/CD avec une empreinte minimale.",
+    "icon": "file-code",
+    "accent_color": "#10B981",
+    "default_port": 3000,
+    "internal_port": 3000,
+    "compose_yml": "services:\n  gitea:\n    image: gitea/gitea:latest\n    container_name: gitea\n    restart: unless-stopped\n    environment:\n      USER_UID: \"1000\"\n      USER_GID: \"1000\"\n    ports:\n      - \"${APP_PORT:-3000}:3000\"\n      - \"2222:22\"\n    volumes:\n      - ./data:/data\n      - /etc/timezone:/etc/timezone:ro\n      - /etc/localtime:/etc/localtime:ro\n"
+  },
+  {
+    "slug": "uptime-kuma",
+    "name": "Uptime Kuma",
+    "category": "Monitoring",
+    "tagline": "Surveillance élégante de disponibilité HTTP, TCP, DNS et Docker",
+    "description": "Tableaux de bord de statut temps réel et alertes multi-canaux (Telegram, Discord, Webhook, SMTP).",
+    "icon": "activity",
+    "accent_color": "#22C55E",
+    "default_port": 3001,
+    "internal_port": 3001,
+    "compose_yml": "services:\n  uptime-kuma:\n    image: louislam/uptime-kuma:1\n    container_name: uptime-kuma\n    restart: unless-stopped\n    ports:\n      - \"${APP_PORT:-3001}:3001\"\n    volumes:\n      - ./data:/app/data\n      - /var/run/docker.sock:/var/run/docker.sock:ro\n"
+  },
+  {
+    "slug": "adguard-home",
+    "name": "AdGuard Home",
+    "category": "Réseau & Sécurité",
+    "tagline": "Serveur DNS bloqueur de publicités et de traqueurs sur tout le réseau",
+    "description": "Protégez tous les appareils de votre réseau LAN ou Tailscale au niveau DNS avec statistiques temps réel.",
+    "icon": "globe",
+    "accent_color": "#0EA5E9",
+    "default_port": 3080,
+    "internal_port": 3000,
+    "compose_yml": "services:\n  adguardhome:\n    image: adguard/adguardhome:latest\n    container_name: adguardhome\n    restart: unless-stopped\n    ports:\n      - \"53:53/tcp\"\n      - \"53:53/udp\"\n      - \"${APP_PORT:-3080}:3000/tcp\"\n    volumes:\n      - ./work:/opt/adguardhome/work\n      - ./conf:/opt/adguardhome/conf\n"
+  },
+  {
+    "slug": "stirling-pdf",
+    "name": "Stirling-PDF",
+    "category": "Productivité",
+    "tagline": "Suite complète de manipulation PDF 100 % locale (fusion, OCR, signature)",
+    "description": "Plus de 50 opérations sur vos documents PDF sans jamais envoyer vos fichiers dans le cloud.",
+    "icon": "book-open",
+    "accent_color": "#EF4444",
+    "default_port": 8085,
+    "internal_port": 8080,
+    "compose_yml": "services:\n  stirling-pdf:\n    image: stirlingtools/stirling-pdf:latest\n    container_name: stirling-pdf\n    restart: unless-stopped\n    ports:\n      - \"${APP_PORT:-8085}:8080\"\n    volumes:\n      - ./configs:/configs\n      - ./logs:/logs\n"
+  },
+  {
+    "slug": "open-webui",
+    "name": "Open WebUI",
+    "category": "Intelligence Artificielle",
+    "tagline": "Interface riche de chat IA & RAG pour Ollama et APIs OpenAI",
+    "description": "Espace collaboratif IA avec recherche documentaire RAG, exécution de code et support multimodal.",
+    "icon": "sparkles",
+    "accent_color": "#6366F1",
+    "default_port": 3005,
+    "internal_port": 8080,
+    "compose_yml": "services:\n  open-webui:\n    image: ghcr.io/open-webui/open-webui:main\n    container_name: open-webui\n    restart: unless-stopped\n    extra_hosts:\n      - \"host.docker.internal:host-gateway\"\n    environment:\n      OLLAMA_BASE_URL: \"http://host.docker.internal:11434\"\n    ports:\n      - \"${APP_PORT:-3005}:8080\"\n    volumes:\n      - ./data:/app/backend/data\n"
+  },
+  {
+    "slug": "it-tools",
+    "name": "IT-Tools",
+    "category": "Développement",
+    "tagline": "Boîte à outils suisse pour développeurs et administrateurs système",
+    "description": "Plus de 80 utilitaires web instantanés : générateurs de tokens, convertisseurs, parseurs JWT, IPv4/CIDR, crontab, Docker run -> Compose.",
+    "icon": "terminal",
+    "accent_color": "#14B8A6",
+    "default_port": 8088,
+    "internal_port": 80,
+    "compose_yml": "services:\n  it-tools:\n    image: corentinth/it-tools:latest\n    container_name: it-tools\n    restart: unless-stopped\n    ports:\n      - \"${APP_PORT:-8088}:80\"\n"
+  }
+]

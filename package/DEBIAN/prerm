@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Vanill-IA OS — Debian Pre-Removal Script (prerm)
+# ==============================================================================
+set -euo pipefail
+
+case "${1:-}" in
+    remove|deconfigure)
+        if [[ -x /usr/local/bin/vanill-ia-browser-ctl ]]; then
+            /usr/local/bin/vanill-ia-browser-ctl stop >/dev/null 2>&1 || true
+        fi
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            echo "[Vanill-IA OS] Arrêt propre du daemon vanill-ia-agent..."
+            systemctl stop vanill-ia-agent.service >/dev/null 2>&1 || true
+            systemctl disable vanill-ia-agent.service >/dev/null 2>&1 || true
+        fi
+        rm -f /run/vanill-ia/agent.sock
+        ;;
+
+    upgrade|failed-upgrade)
+        if [[ -x /usr/local/bin/vanill-ia-browser-ctl ]]; then
+            /usr/local/bin/vanill-ia-browser-ctl stop >/dev/null 2>&1 || true
+        fi
+        if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+            systemctl stop vanill-ia-agent.service >/dev/null 2>&1 || true
+        fi
+        ;;
+
+    *)
+        echo "prerm appelé avec un argument inconnu : '${1:-}'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

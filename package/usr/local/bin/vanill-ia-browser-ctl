@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Vanill-IA OS — Ephemeral Remote Browser Isolation Controller
+# Multi-Distro Support: Debian 12/13, Ubuntu 22.04/24.04+, Raspberry Pi OS
+# Dynamically detects Chromium (`chromium`, `chromium-browser`, `/snap/bin/chromium`),
+# VNC server (`Xtigervnc` or `Xtightvnc`), and noVNC webroot (`/usr/share/novnc`).
+# ==============================================================================
+set -euo pipefail
+
+ENV_HELPER="/usr/share/vanill-ia-os/lib/env-detect.sh"
+if [[ -f "${ENV_HELPER}" ]]; then
+    # shellcheck source=/dev/null
+    . "${ENV_HELPER}"
+fi
+
+BROWSER_USER="vanill-ia-browser"
+DISPLAY_NUM=":99"
+VNC_PORT="5999"
+WS_PORT="6080"
+
+resolve_chromium_bin() {
+    if declare -F vanillia_detect_chromium_bin >/dev/null 2>&1; then
+        vanillia_detect_chromium_bin && return 0
+    fi
+    local c
+    for c in "$(command -v chromium 2>/dev/null || true)" "$(command -v chromium-browser 2>/dev/null || true)" "/snap/bin/chromium"; do
+        if [[ -n "${c}" && -x "${c}" ]]; then
+            echo "${c}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_vnc_bin() {
+    local v
+    for v in "$(command -v Xtigervnc 2>/dev/null || true)" "$(command -v Xtightvnc 2>/dev/null || true)"; do
+        if [[ -n "${v}" && -x "${v}" ]]; then
+            echo "${v}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_novnc_web() {
+    if declare -F vanillia_detect_novnc_webroot >/dev/null 2>&1; then
+        vanillia_detect_novnc_webroot && return 0
+    fi
+    [[ -d "/usr/share/novnc" ]] && echo "/usr/share/novnc" && return 0
+    return 1
+}
+
+is_snap_chromium() {
+    local bin="$1"
+    [[ "${bin}" == /snap/* ]] && return 0
+    if [[ -f "${bin}" ]] && head -c 512 "${bin}" 2>/dev/null | grep -qi "snap"; then
+        return 0
+    fi
+    return 1
+}
+
+is_port_open() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltn "sport = :${port}" 2>/dev/null | grep -q ":${port}"
+    else
+        (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
+    fi
+}
+
+check_dependencies() {
+    local missing=()
+    resolve_vnc_bin >/dev/null 2>&1 || missing+=("tigervnc-standalone-server")
+    command -v openbox >/dev/null 2>&1 || missing+=("openbox")
+    resolve_chromium_bin >/dev/null 2>&1 || missing+=("chromium")
+    command -v websockify >/dev/null 2>&1 || missing+=("websockify")
+    resolve_novnc_web >/dev/null 2>&1 || missing+=("novnc")
+    echo "${missing[*]:-}"
+}
+
+stop_session() {
+    if id -u "${BROWSER_USER}" >/dev/null 2>&1; then
+        pkill -TERM -u "${BROWSER_USER}" >/dev/null 2>&1 || true
+        for _ in 1 2 3 4 5; do
+            if ! pgrep -u "${BROWSER_USER}" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 0.2
+        done
+        pkill -KILL -u "${BROWSER_USER}" >/dev/null 2>&1 || true
+    fi
+
+    rm -f "/tmp/.X99-lock" "/tmp/.X11-unix/X99"
+    rm -rf "/tmp/vanill-ia-browser-profile"
+    if [[ -d "/home/${BROWSER_USER}" ]]; then
+        rm -rf "/home/${BROWSER_USER}/ephemeral-profile" "/home/${BROWSER_USER}/snap" "/home/${BROWSER_USER}/.config" "/home/${BROWSER_USER}/.cache"
+    fi
+}
+
+status_json() {
+    local missing
+    missing="$(check_dependencies)"
+    local vnc_up="false"
+    local ws_up="false"
+    local running="false"
+    local rss_kb=0
+
+    if is_port_open "${VNC_PORT}"; then vnc_up="true"; fi
+    if is_port_open "${WS_PORT}"; then ws_up="true"; fi
+    if [[ "${vnc_up}" == "true" && "${ws_up}" == "true" ]]; then
+        running="true"
+    fi
+
+    if id -u "${BROWSER_USER}" >/dev/null 2>&1 && pgrep -u "${BROWSER_USER}" >/dev/null 2>&1; then
+        rss_kb="$(ps -u "${BROWSER_USER}" -o rss= 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+    fi
+
+    printf '{"running":%s,"vnc_ready":%s,"novnc_ready":%s,"ram_mb":%d,"missing_packages":"%s"}\n' \
+        "${running}" "${vnc_up}" "${ws_up}" "$((rss_kb / 1024))" "${missing}"
+}
+
+start_session() {
+    local initial_url="${1:-https://duckduckgo.com}"
+    if [[ ! "${initial_url}" =~ ^https?:// ]]; then
+        initial_url="https://duckduckgo.com"
+    fi
+
+    local missing
+    missing="$(check_dependencies)"
+    if [[ -n "${missing}" ]]; then
+        echo "Missing required packages: ${missing}" >&2
+        exit 12
+    fi
+
+    local CHROMIUM_BIN
+    CHROMIUM_BIN="$(resolve_chromium_bin)"
+    local VNC_BIN
+    VNC_BIN="$(resolve_vnc_bin)"
+    local NOVNC_WEB
+    NOVNC_WEB="$(resolve_novnc_web)"
+
+    local PROFILE_DIR="/tmp/vanill-ia-browser-profile"
+    local USER_HOME="/tmp/vanill-ia-browser-profile"
+    if is_snap_chromium "${CHROMIUM_BIN}"; then
+        USER_HOME="/home/${BROWSER_USER}"
+        PROFILE_DIR="/home/${BROWSER_USER}/ephemeral-profile"
+    fi
+
+    # Idempotent fast-path if session is already healthy
+    if is_port_open "${VNC_PORT}" && is_port_open "${WS_PORT}"; then
+        if [[ -n "${1:-}" && "${1:-}" =~ ^https?:// ]]; then
+            nohup runuser -u "${BROWSER_USER}" -- env \
+                HOME="${USER_HOME}" \
+                XDG_CONFIG_HOME="${PROFILE_DIR}/.config" \
+                XDG_CACHE_HOME="${PROFILE_DIR}/.cache" \
+                DISPLAY="${DISPLAY_NUM}" \
+                "${CHROMIUM_BIN}" \
+                    --no-sandbox \
+                    --test-type \
+                    --disable-dev-shm-usage \
+                    --user-data-dir="${PROFILE_DIR}/chrome-data" \
+                    "${initial_url}" \
+                    </dev/null >/dev/null 2>&1 &
+        fi
+        status_json
+        exit 0
+    fi
+
+    id -u "${BROWSER_USER}" >/dev/null 2>&1 || useradd -r -m -s /bin/false "${BROWSER_USER}"
+
+    stop_session
+
+    mkdir -p -m 1777 /tmp/.X11-unix
+    mkdir -p -m 0700 "${PROFILE_DIR}" "${PROFILE_DIR}/.config" "${PROFILE_DIR}/.cache"
+    chown -R "${BROWSER_USER}:${BROWSER_USER}" "${USER_HOME}" "${PROFILE_DIR}" 2>/dev/null || chown -R "${BROWSER_USER}:${BROWSER_USER}" "${PROFILE_DIR}"
+
+    # 1. Start VNC server strictly bound to localhost:5999 (1280x800 initial geometry)
+    if [[ "$(basename "${VNC_BIN}")" == "Xtigervnc" ]]; then
+        nohup runuser -u "${BROWSER_USER}" -- env \
+            HOME="${USER_HOME}" \
+            XDG_CONFIG_HOME="${PROFILE_DIR}/.config" \
+            XDG_CACHE_HOME="${PROFILE_DIR}/.cache" \
+            "${VNC_BIN}" "${DISPLAY_NUM}" \
+                -localhost \
+                -rfbport "${VNC_PORT}" \
+                -geometry 1280x800 \
+                -depth 24 \
+                -SecurityTypes None \
+                -AlwaysShared \
+                -AcceptSetDesktopSize=1 \
+                </dev/null >/dev/null 2>&1 &
+    else
+        nohup runuser -u "${BROWSER_USER}" -- env \
+            HOME="${USER_HOME}" \
+            "${VNC_BIN}" "${DISPLAY_NUM}" \
+                -localhost \
+                -rfbport "${VNC_PORT}" \
+                -geometry 1280x800 \
+                -depth 24 \
+                </dev/null >/dev/null 2>&1 &
+    fi
+
+    for _ in $(seq 1 25); do
+        if is_port_open "${VNC_PORT}" && [[ -S "/tmp/.X11-unix/X99" ]]; then
+            break
+        fi
+        sleep 0.15
+    done
+
+    if ! is_port_open "${VNC_PORT}"; then
+        stop_session
+        echo "VNC server failed to bind 127.0.0.1:${VNC_PORT}" >&2
+        exit 13
+    fi
+
+    # 2. Start Openbox window manager on :99
+    nohup runuser -u "${BROWSER_USER}" -- env \
+        HOME="${USER_HOME}" \
+        XDG_CONFIG_HOME="${PROFILE_DIR}/.config" \
+        XDG_CACHE_HOME="${PROFILE_DIR}/.cache" \
+        DISPLAY="${DISPLAY_NUM}" \
+        openbox </dev/null >/dev/null 2>&1 &
+
+    sleep 0.25
+
+    # 3. Start Chromium (--test-type suppresses the --no-sandbox warning banner)
+    nohup runuser -u "${BROWSER_USER}" -- env \
+        HOME="${USER_HOME}" \
+        XDG_CONFIG_HOME="${PROFILE_DIR}/.config" \
+        XDG_CACHE_HOME="${PROFILE_DIR}/.cache" \
+        DISPLAY="${DISPLAY_NUM}" \
+        "${CHROMIUM_BIN}" \
+            --no-sandbox \
+            --test-type \
+            --disable-dev-shm-usage \
+            --no-first-run \
+            --no-default-browser-check \
+            --disable-gpu \
+            --start-maximized \
+            --user-data-dir="${PROFILE_DIR}/chrome-data" \
+            "${initial_url}" \
+            </dev/null >/dev/null 2>&1 &
+
+    # 4. Start websockify + noVNC strictly on 127.0.0.1:6080 -> 127.0.0.1:5999
+    nohup runuser -u "${BROWSER_USER}" -- env \
+        HOME="${USER_HOME}" \
+        websockify --web="${NOVNC_WEB}" "127.0.0.1:${WS_PORT}" "127.0.0.1:${VNC_PORT}" \
+        </dev/null >/dev/null 2>&1 &
+
+    for _ in $(seq 1 25); do
+        if is_port_open "${WS_PORT}"; then
+            break
+        fi
+        sleep 0.15
+    done
+
+    if ! is_port_open "${WS_PORT}"; then
+        stop_session
+        echo "websockify failed to bind 127.0.0.1:${WS_PORT}" >&2
+        exit 14
+    fi
+
+    status_json
+}
+
+case "${1:-status}" in
+    start)
+        start_session "${2:-}"
+        ;;
+    stop)
+        stop_session
+        status_json
+        ;;
+    status)
+        status_json
+        ;;
+    *)
+        echo "Usage: vanill-ia-browser-ctl {start|stop|status}" >&2
+        exit 2
+        ;;
+esac

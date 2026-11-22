@@ -1,0 +1,19 @@
+# ==============================================================================
+# Vanill-IA OS — Dedicated Remote Browser Isolation Snippet (Persistent Route)
+# Imported into active WebOS Caddy site blocks (`vanill-ia-os.caddy`).
+# Protected by `forward_auth` against `/api/auth-check.php` — ports 5999 & 6080
+# remain strictly bound to 127.0.0.1 and are never exposed publicly.
+# ==============================================================================
+
+(vanill-ia-browser) {
+    @browser_bare path /browser /browser/
+    redir @browser_bare /browser/vnc.html?autoconnect=true&resize=remote&path=browser/websockify 302
+
+    handle_path /browser/* {
+        forward_auth 127.0.0.1:8080 {
+            uri /api/auth-check.php
+            copy_headers X-Vanillia-User
+        }
+        reverse_proxy 127.0.0.1:6080
+    }
+}

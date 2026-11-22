@@ -1,0 +1,63 @@
+# ==============================================================================
+# Vanill-IA OS — Default WebOS Reverse Proxy & PHP-FPM Gateway
+# HTTPS (:8443, TLS internal) for standalone PWA installation on LAN/IP
+# HTTP  (:8080) for local access and internal Caddy `forward_auth` checks
+# ==============================================================================
+
+:8443 {
+    tls internal
+    root * /usr/share/vanill-ia-os
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Service-Worker-Allowed "/"
+        -Server
+    }
+
+    @sw_no_cache path /sw.js /manifest.json
+    header @sw_no_cache Cache-Control "no-cache, must-revalidate"
+
+    import vanill-ia-browser
+
+    # Strict protection of sensitive internal files
+    @forbidden {
+        path /config/* *.sql *.db *.db-wal *.db-shm /.*
+    }
+    respond @forbidden 403
+
+    php_fastcgi unix//run/php/php-fpm.sock {
+        env VANILL_IA_ENV production
+    }
+
+    file_server
+}
+
+:8080 {
+    root * /usr/share/vanill-ia-os
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Service-Worker-Allowed "/"
+        -Server
+    }
+
+    @sw_no_cache path /sw.js /manifest.json
+    header @sw_no_cache Cache-Control "no-cache, must-revalidate"
+
+    import vanill-ia-browser
+
+    @forbidden {
+        path /config/* *.sql *.db *.db-wal *.db-shm /.*
+    }
+    respond @forbidden 403
+
+    php_fastcgi unix//run/php/php-fpm.sock {
+        env VANILL_IA_ENV production
+    }
+
+    file_server
+}

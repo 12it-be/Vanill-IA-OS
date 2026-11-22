@@ -1,0 +1,191 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Vanill-IA OS — Cron Task Execution & Telemetry Wrapper
+ * Invoked by /etc/cron.d/vanill-ia or manually via vanill-ia-agent:
+ *   /usr/local/bin/vanill-ia-cron-run <job_id> [--manual]
+ */
+
+if (PHP_SAPI !== 'cli') {
+    fwrite(STDERR, "Ce script doit être exécuté en mode CLI.\n");
+    exit(1);
+}
+
+$jobId = isset($argv[1]) ? (int) $argv[1] : 0;
+$triggeredBy = in_array('--manual', $argv, true) ? 'manual' : 'schedule';
+
+if ($jobId <= 0) {
+    fwrite(STDERR, "Usage: vanill-ia-cron-run <job_id> [--manual]\n");
+    exit(2);
+}
+
+$dbPath = '/var/lib/vanill-ia-os/data/vanill-ia.db';
+if (!is_file($dbPath)) {
+    fwrite(STDERR, "Base SQLite introuvable : {$dbPath}\n");
+    exit(3);
+}
+
+try {
+    $pdo = new PDO('sqlite:' . $dbPath, null, null, [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_TIMEOUT            => 10,
+    ]);
+    $pdo->exec('PRAGMA journal_mode = WAL;');
+    $pdo->exec('PRAGMA busy_timeout = 5000;');
+} catch (Throwable $e) {
+    fwrite(STDERR, "Erreur d'ouverture SQLite : " . $e->getMessage() . "\n");
+    exit(4);
+}
+
+$stmt = $pdo->prepare('SELECT * FROM cron_jobs WHERE id = :id LIMIT 1');
+$stmt->execute([':id' => $jobId]);
+$job = $stmt->fetch();
+
+if ($job === false) {
+    fwrite(STDERR, "Tâche cron #{$jobId} introuvable.\n");
+    exit(5);
+}
+
+$command = (string) $job['command'];
+$workingDir = !empty($job['working_dir']) && is_dir((string) $job['working_dir'])
+    ? (string) $job['working_dir']
+    : '/root';
+$runUser = (string) ($job['run_user'] ?: 'root');
+
+// Si exécuté manuellement par root alors que la tâche cible un autre utilisateur système
+if (posix_geteuid() === 0 && $runUser !== 'root' && preg_match('/^[a-z_][a-z0-9_-]{0,31}$/', $runUser) === 1) {
+    $execCmd = sprintf('sudo -n -u %s -- /bin/bash -lc %s', escapeshellarg($runUser), escapeshellarg($command));
+} else {
+    $execCmd = sprintf('/bin/bash -lc %s', escapeshellarg($command));
+}
+
+$startedAt = gmdate('Y-m-d H:i:s');
+$startNs = hrtime(true);
+
+$descriptors = [
+    0 => ['pipe', 'r'],
+    1 => ['pipe', 'w'],
+    2 => ['pipe', 'w'],
+];
+
+$process = proc_open($execCmd, $descriptors, $pipes, $workingDir);
+$output = '';
+$exitCode = 1;
+
+if (is_resource($process)) {
+    fclose($pipes[0]);
+    stream_set_blocking($pipes[1], false);
+    stream_set_blocking($pipes[2], false);
+
+    $maxBytes = 262144; // 256 Ko max conservés en base par exécution
+    while (true) {
+        $read = [];
+        if (!feof($pipes[1])) {
+            $read[] = $pipes[1];
+        }
+        if (!feof($pipes[2])) {
+            $read[] = $pipes[2];
+        }
+        if ($read === []) {
+            break;
+        }
+        $write = null;
+        $except = null;
+        if (@stream_select($read, $write, $except, 1, 0) > 0) {
+            foreach ($read as $stream) {
+                $chunk = fread($stream, 8192);
+                if ($chunk !== false && $chunk !== '' && strlen($output) < $maxBytes) {
+                    $output .= substr($chunk, 0, $maxBytes - strlen($output));
+                }
+            }
+        }
+    }
+
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exitCode = proc_close($process);
+} else {
+    $output = "Impossible de démarrer le sous-processus pour la commande.";
+    $exitCode = 127;
+}
+
+$durationMs = (int) round((hrtime(true) - $startNs) / 1_000_000);
+$finishedAt = gmdate('Y-m-d H:i:s');
+
+try {
+    $pdo->beginTransaction();
+
+    $insertLog = $pdo->prepare(
+        'INSERT INTO cron_logs (job_id, started_at, finished_at, duration_ms, exit_code, output, triggered_by)
+         VALUES (:job_id, :started_at, :finished_at, :duration_ms, :exit_code, :output, :triggered_by)'
+    );
+    $insertLog->execute([
+        ':job_id'       => $jobId,
+        ':started_at'   => $startedAt,
+        ':finished_at'  => $finishedAt,
+        ':duration_ms'  => $durationMs,
+        ':exit_code'    => $exitCode,
+        ':output'       => $output,
+        ':triggered_by' => $triggeredBy,
+    ]);
+
+    $updateJob = $pdo->prepare(
+        'UPDATE cron_jobs
+         SET last_run_at = :last_run_at,
+             last_exit_code = :last_exit_code,
+             last_duration_ms = :last_duration_ms,
+             last_output = :last_output,
+             updated_at = :updated_at
+         WHERE id = :id'
+    );
+    $updateJob->execute([
+        ':last_run_at'      => $finishedAt,
+        ':last_exit_code'   => $exitCode,
+        ':last_duration_ms' => $durationMs,
+        ':last_output'      => $output,
+        ':updated_at'       => $finishedAt,
+        ':id'               => $jobId,
+    ]);
+
+    // Purge automatique au-delà des 50 dernières exécutions par tâche
+    $pruneStmt = $pdo->prepare(
+        'DELETE FROM cron_logs
+         WHERE job_id = :job_id
+           AND id NOT IN (
+               SELECT id FROM cron_logs WHERE job_id = :job_id_sub ORDER BY id DESC LIMIT 50
+           )'
+    );
+    $pruneStmt->execute([':job_id' => $jobId, ':job_id_sub' => $jobId]);
+
+    // Création d'une notification système si la tâche a échoué
+    if ($exitCode !== 0 && (int) $job['notify_on_fail'] === 1) {
+        $notifStmt = $pdo->prepare(
+            'INSERT INTO notifications (level, source, title, message, action_payload_json, created_at)
+             VALUES (:level, :source, :title, :message, :payload, :created_at)'
+        );
+        $notifStmt->execute([
+            ':level'      => 'error',
+            ':source'     => 'cron-manager',
+            ':title'      => 'Échec de la tâche planifiée : ' . $job['title'],
+            ':message'    => sprintf('Code retour %d (%d ms). Utilisez Vanill-IA pour diagnostiquer la sortie.', $exitCode, $durationMs),
+            ':payload'    => json_encode([
+                'app'    => 'cron-manager',
+                'job_id' => $jobId,
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            ':created_at' => $finishedAt,
+        ]);
+    }
+
+    $pdo->commit();
+} catch (Throwable $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    fwrite(STDERR, "Erreur d'enregistrement SQLite : " . $e->getMessage() . "\n");
+}
+
+exit($exitCode);
