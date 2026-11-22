@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Vanill-IA OS — Debian / Ubuntu / Raspberry Pi OS Post-Installation Script
+# Includes automatic free-port selection (`ss -tlnp`) and Caddy TLS conflict
+# prevention when Let's Encrypt domain blocks already exist in `/etc/caddy/Caddyfile`.
 # ==============================================================================
 set -euo pipefail
 
@@ -21,6 +23,170 @@ if [[ -f "${ENV_HELPER}" ]]; then
     # shellcheck source=/dev/null
     . "${ENV_HELPER}"
 fi
+
+# Returns 0 (true) if `port` is currently bound by a NON-Caddy process
+is_port_occupied_by_other() {
+    local port="$1"
+    if ! command -v ss >/dev/null 2>&1; then
+        return 1
+    fi
+    local lines
+    lines="$(ss -tlnp 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {print $0}' || true)"
+    if [[ -z "${lines}" ]]; then
+        return 1
+    fi
+    # If Caddy itself owns the listener (e.g. during package upgrade), the port is safe to keep
+    if echo "${lines}" | grep -q '"caddy"'; then
+        return 1
+    fi
+    return 0
+}
+
+find_next_free_port() {
+    local candidate="$1"
+    local avoid="${2:-0}"
+    while [[ "${candidate}" -eq "${avoid}" ]] || is_port_occupied_by_other "${candidate}"; do
+        candidate=$((candidate + 1))
+    done
+    echo "${candidate}"
+}
+
+# Detects whether existing Caddy configs already define public ACME / Let's Encrypt domain blocks
+caddy_has_public_acme_sites() {
+    local f
+    for f in "${CADDY_MAIN}" /etc/caddy/conf.d/*.caddy; do
+        [[ -f "${f}" ]] || continue
+        [[ "${f}" == "${CADDY_CONF}" || "${f}" == "${CADDY_BROWSER_CONF}" ]] && continue
+        # Match site headers like `example.com {` or `sub.domain.tld, other.tld {` (excluding snippets `(name)`, `:port`, `http://`, `localhost`, IPs)
+        if awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*\(/ { next }
+            /^[^{]+\{[[:space:]]*$/ {
+                line = $0
+                sub(/\{[[:space:]]*$/, "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                if (line ~ /^https?:\/\// && line !~ /^https:\/\//) next
+                if (line ~ /^:[0-9]+$/) next
+                if (line ~ /^(localhost|127\.0\.0\.1)/) next
+                if (line ~ /[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/) { found=1; exit 0 }
+            }
+            END { exit(found ? 0 : 1) }
+        ' "${f}" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+write_vanillia_os_caddy() {
+    local mode_tls="$1" # "dual" or "http_only"
+    local http_port="$2"
+    local https_port="$3"
+    local php_sock="$4"
+
+    if [[ "${mode_tls}" == "dual" ]]; then
+        cat > "${CADDY_CONF}" <<EOF
+# ==============================================================================
+# Vanill-IA OS — WebOS Reverse Proxy & PHP-FPM Gateway
+# HTTPS (:${https_port}, TLS internal) & HTTP (:${http_port})
+# ==============================================================================
+
+:${https_port} {
+    tls internal
+    root * /usr/share/vanill-ia-os
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Service-Worker-Allowed "/"
+        -Server
+    }
+
+    @sw_no_cache path /sw.js /manifest.json
+    header @sw_no_cache Cache-Control "no-cache, must-revalidate"
+
+    import vanill-ia-browser
+
+    @forbidden {
+        path /config/* *.sql *.db *.db-wal *.db-shm /.*
+    }
+    respond @forbidden 403
+
+    php_fastcgi unix/${php_sock} {
+        env VANILL_IA_ENV production
+    }
+
+    file_server
+}
+
+:${http_port} {
+    root * /usr/share/vanill-ia-os
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Service-Worker-Allowed "/"
+        -Server
+    }
+
+    @sw_no_cache path /sw.js /manifest.json
+    header @sw_no_cache Cache-Control "no-cache, must-revalidate"
+
+    import vanill-ia-browser
+
+    @forbidden {
+        path /config/* *.sql *.db *.db-wal *.db-shm /.*
+    }
+    respond @forbidden 403
+
+    php_fastcgi unix/${php_sock} {
+        env VANILL_IA_ENV production
+    }
+
+    file_server
+}
+EOF
+    else
+        cat > "${CADDY_CONF}" <<EOF
+# ==============================================================================
+# Vanill-IA OS — Local HTTP Listener (:${http_port})
+# Generated without catch-all 'tls internal' to coexist cleanly with existing
+# Let's Encrypt / ACME domain blocks in /etc/caddy/Caddyfile.
+# ==============================================================================
+
+:${http_port} {
+    root * /usr/share/vanill-ia-os
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Service-Worker-Allowed "/"
+        -Server
+    }
+
+    @sw_no_cache path /sw.js /manifest.json
+    header @sw_no_cache Cache-Control "no-cache, must-revalidate"
+
+    import vanill-ia-browser
+
+    @forbidden {
+        path /config/* *.sql *.db *.db-wal *.db-shm /.*
+    }
+    respond @forbidden 403
+
+    php_fastcgi unix/${php_sock} {
+        env VANILL_IA_ENV production
+    }
+
+    file_server
+}
+EOF
+    fi
+    chmod 0644 "${CADDY_CONF}"
+}
 
 case "${1:-}" in
     configure)
@@ -49,6 +215,8 @@ case "${1:-}" in
         chown www-data:adm "${AUTH_LOG}" 2>/dev/null || chown www-data:www-data "${AUTH_LOG}"
         chmod 0640 "${AUTH_LOG}"
 
+        chown root:www-data "${DATA_ROOT}"
+        chmod 0775 "${DATA_ROOT}"
         chown -R www-data:www-data "${DATA_ROOT}/data" "${DATA_ROOT}/notes" "${DATA_ROOT}/tmp" "${DATA_ROOT}/sessions"
         chown -R root:www-data "${DATA_ROOT}/stacks" "${DATA_ROOT}/apps"
         chmod 0750 "${DATA_ROOT}/data" "${DATA_ROOT}/notes" "${DATA_ROOT}/tmp"
@@ -58,16 +226,19 @@ case "${1:-}" in
         chown root:www-data "/run/vanill-ia"
         chmod 0750 "/run/vanill-ia"
 
-        for bin in /usr/local/bin/vanill-ia-agent /usr/local/bin/vanill-ia-cron-run /usr/local/bin/vanill-ia-os /usr/local/bin/vanill-ia-browser-ctl; do
+        for bin in \
+            /usr/local/bin/vanill-ia-agent \
+            /usr/local/bin/vanill-ia-cron-run \
+            /usr/local/bin/vanill-ia-os \
+            /usr/local/bin/vanill-ia-browser-ctl \
+            /usr/local/bin/vanill-ia-docker-install; do
             if [[ -f "${bin}" ]]; then
                 chmod 0755 "${bin}"
             fi
         done
 
-        # Dedicated unprivileged user for isolated remote browser sessions
         id -u vanill-ia-browser >/dev/null 2>&1 || useradd -r -m -s /bin/false vanill-ia-browser
 
-        # 256-bit master key for at-rest secret encryption
         if [[ ! -f "${SECRET_KEY_FILE}" ]]; then
             php -r 'echo bin2hex(random_bytes(32));' > "${SECRET_KEY_FILE}"
             chown www-data:www-data "${SECRET_KEY_FILE}"
@@ -113,7 +284,7 @@ Your server is now managed through **Vanill-IA OS**.
 
 ## Quick Overview
 - **Security**: Argon2id + TOTP 2FA (RFC 6238) + Fail2ban protection (`/var/log/vanill-ia-auth.log`).
-- **Docker & Stacks**: Manage containers and `docker-compose.yml` stacks transparently in `/opt/vanill-ia/stacks/`.
+- **Lightweight Mode**: Runs natively with zero container overhead; Docker Engine can be installed in 1 click anytime from *Docker & Apps*.
 - **AI Diagnostics**: Connect local **Ollama** or BYOK API keys (**Gemini 3.8 Flash**, OpenRouter, OpenAI, Anthropic) to diagnose logs in one click.
 EOF
                 chown www-data:www-data "${DATA_ROOT}/notes/Welcome.md"
@@ -124,7 +295,7 @@ EOF
             chown www-data:www-data "${DATA_ROOT}/data"
         fi
 
-        # Enable & start the detected PHP-FPM service before resolving its Unix socket
+        # Enable & start PHP-FPM before detecting its Unix socket
         PHP_FPM_SERVICE=""
         if declare -F vanillia_detect_php_fpm_service >/dev/null 2>&1; then
             PHP_FPM_SERVICE="$(vanillia_detect_php_fpm_service)"
@@ -137,15 +308,13 @@ EOF
             else
                 while IFS= read -r fpm_unit_path; do
                     if [[ -n "${fpm_unit_path}" ]]; then
-                        fpm_unit="$(basename "${fpm_unit_path}")"
-                        systemctl enable --now "${fpm_unit}" >/dev/null 2>&1 || true
+                        systemctl enable --now "$(basename "${fpm_unit_path}")" >/dev/null 2>&1 || true
                         break
                     fi
                 done < <(ls -1 /lib/systemd/system/php*-fpm.service /usr/lib/systemd/system/php*-fpm.service /lib/systemd/system/php-fpm.service /usr/lib/systemd/system/php-fpm.service 2>/dev/null | sort -Vr || true)
             fi
         fi
 
-        # Dynamically detect active PHP-FPM Unix socket (PHP 8.1 / 8.2 / 8.3 / 8.4+)
         if declare -F vanillia_detect_php_fpm_socket >/dev/null 2>&1; then
             PHP_FPM_SOCK="$(vanillia_detect_php_fpm_socket)"
         else
@@ -154,38 +323,42 @@ EOF
             PHP_FPM_SOCK="${PHP_FPM_SOCK:-/run/php/php-fpm.sock}"
         fi
 
-        ACTIVE_HTTP_PORT="8080"
+        # ----------------------------------------------------------------------
+        # Caddy Port Conflict Detection (`ss -tlnp`) & TLS Policy Conflict Guard
+        # ----------------------------------------------------------------------
+        PREF_HTTP_PORT="8080"
+        PREF_HTTPS_PORT="8443"
         if [[ -f "${CADDY_CONF}" ]]; then
-            sed -i -E "s|unix//run/php[^[:space:]]*\.sock|unix/${PHP_FPM_SOCK}|g" "${CADDY_CONF}"
-
-            if [[ -f "${CADDY_BROWSER_CONF}" ]] && ! grep -q "import vanill-ia-browser" "${CADDY_CONF}"; then
-                sed -i '/Service-Worker-Allowed/{n;s/}/}\n\n    import vanill-ia-browser/;}' "${CADDY_CONF}" || true
-            fi
-
-            DETECTED_PORT="$(php -r '
+            EXISTING_PORTS="$(php -r '
                 $c = @file_get_contents($argv[1]) ?: "";
-                if (preg_match_all("/^(?:http:\/\/)?(?:127\.0\.0\.1|localhost)?:([0-9]{2,5})\s*\{([\s\S]*?)^\}/m", $c, $m, PREG_SET_ORDER)) {
+                $http = "8080"; $https = "8443";
+                if (preg_match_all("/^([^\s{#][^{]*?)\s*\{([\s\S]*?)^\}/m", $c, $m, PREG_SET_ORDER)) {
                     foreach ($m as $blk) {
-                        if (!preg_match("/^\s*tls\s+/m", $blk[2])) {
-                            echo $blk[1];
-                            exit(0);
+                        if (preg_match("/:([0-9]{2,5})\b/", trim($blk[1]), $pm)) {
+                            if (preg_match("/^\s*tls\s+/m", $blk[2])) $https = $pm[1];
+                            else $http = $pm[1];
                         }
                     }
                 }
-                echo "8080";
-            ' "${CADDY_CONF}" 2>/dev/null || echo "8080")"
-
-            if [[ "${DETECTED_PORT}" =~ ^[0-9]{2,5}$ ]]; then
-                ACTIVE_HTTP_PORT="${DETECTED_PORT}"
-            fi
+                echo $http . "|" . $https;
+            ' "${CADDY_CONF}" 2>/dev/null || echo "8080|8443")"
+            PREF_HTTP_PORT="${EXISTING_PORTS%%|*}"
+            PREF_HTTPS_PORT="${EXISTING_PORTS##*|}"
         fi
 
-        if [[ -f "${CADDY_BROWSER_CONF}" ]]; then
-            sed -i -E "s|forward_auth[[:space:]]+127\.0\.0\.1:[0-9]+|forward_auth 127.0.0.1:${ACTIVE_HTTP_PORT}|g" "${CADDY_BROWSER_CONF}"
+        ACTIVE_HTTP_PORT="$(find_next_free_port "${PREF_HTTP_PORT}" 0)"
+        ACTIVE_HTTPS_PORT="$(find_next_free_port "${PREF_HTTPS_PORT}" "${ACTIVE_HTTP_PORT}")"
+
+        if [[ "${ACTIVE_HTTP_PORT}" != "${PREF_HTTP_PORT}" ]]; then
+            echo "[Vanill-IA OS] Port ${PREF_HTTP_PORT} is occupied by another service -> selected free HTTP port ${ACTIVE_HTTP_PORT}."
+        fi
+        if [[ "${ACTIVE_HTTPS_PORT}" != "${PREF_HTTPS_PORT}" ]]; then
+            echo "[Vanill-IA OS] Port ${PREF_HTTPS_PORT} is occupied by another service -> selected free HTTPS port ${ACTIVE_HTTPS_PORT}."
         fi
 
-        # Configure Caddy if present (gracefully tolerated if installed later on minimal Ubuntu)
+        TLS_CONFLICT_DETECTED=0
         if [[ -d /etc/caddy ]]; then
+            # 1. Ensure /etc/caddy/Caddyfile imports /etc/caddy/conf.d/*.caddy cleanly once
             if [[ -f "${CADDY_MAIN}" ]]; then
                 cp -a "${CADDY_MAIN}" "${CADDY_MAIN}.bak-vanill-ia"
                 sed -i -E 's|^([[:space:]]*import[[:space:]]+/etc/caddy/conf\.d/\*)[[:space:]]*$|\1.caddy|g' "${CADDY_MAIN}"
@@ -208,9 +381,46 @@ EOF
                 chmod 0644 "${CADDY_MAIN}"
             fi
 
+            # 2. Sync forward_auth in vanill-ia-browser.caddy to ACTIVE_HTTP_PORT
+            if [[ -f "${CADDY_BROWSER_CONF}" ]]; then
+                sed -i -E "s|forward_auth[[:space:]]+127\.0\.0\.1:[0-9]+|forward_auth 127.0.0.1:${ACTIVE_HTTP_PORT}|g" "${CADDY_BROWSER_CONF}"
+            fi
+
+            # 3. Check for existing Let's Encrypt / ACME domain blocks to avoid caddytls.InternalIssuer conflict
+            if caddy_has_public_acme_sites; then
+                TLS_CONFLICT_DETECTED=1
+                write_vanillia_os_caddy "http_only" "${ACTIVE_HTTP_PORT}" "${ACTIVE_HTTPS_PORT}" "${PHP_FPM_SOCK}"
+            else
+                # Preserve existing exposure guards if already customized, updating ports & PHP socket, or write clean dual config
+                if [[ -f "${CADDY_CONF}" ]] && grep -q "@blocked_" "${CADDY_CONF}"; then
+                    sed -i -E "s|unix//run/php[^[:space:]]*\.sock|unix/${PHP_FPM_SOCK}|g" "${CADDY_CONF}"
+                    sed -i -E "s|^:[0-9]+[[:space:]]*\{|:__PORT__|; s|forward_auth[[:space:]]+127\.0\.0\.1:[0-9]+|forward_auth 127.0.0.1:${ACTIVE_HTTP_PORT}|g" "${CADDY_CONF}" || true
+                    write_vanillia_os_caddy "dual" "${ACTIVE_HTTP_PORT}" "${ACTIVE_HTTPS_PORT}" "${PHP_FPM_SOCK}"
+                else
+                    write_vanillia_os_caddy "dual" "${ACTIVE_HTTP_PORT}" "${ACTIVE_HTTPS_PORT}" "${PHP_FPM_SOCK}"
+                fi
+
+                # Double-check with `caddy validate` in case an imported file triggers a TLS issuer conflict
+                if command -v caddy >/dev/null 2>&1; then
+                    VAL_OUT="$(caddy validate --config "${CADDY_MAIN}" --adapter caddyfile 2>&1 || true)"
+                    if echo "${VAL_OUT}" | grep -qiE "InternalIssuer|automation policy"; then
+                        TLS_CONFLICT_DETECTED=1
+                        write_vanillia_os_caddy "http_only" "${ACTIVE_HTTP_PORT}" "${ACTIVE_HTTPS_PORT}" "${PHP_FPM_SOCK}"
+                    fi
+                fi
+            fi
+
             if getent group caddy >/dev/null 2>&1; then
                 chown -R root:caddy /etc/caddy/conf.d
                 chmod 0755 /etc/caddy/conf.d
+            fi
+        fi
+
+        # If UFW is currently active, allow the chosen listener port(s)
+        if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+            ufw allow "${ACTIVE_HTTP_PORT}/tcp" >/dev/null 2>&1 || true
+            if [[ "${TLS_CONFLICT_DETECTED}" -eq 0 ]]; then
+                ufw allow "${ACTIVE_HTTPS_PORT}/tcp" >/dev/null 2>&1 || true
             fi
         fi
 
@@ -232,13 +442,28 @@ EOF
             if command -v caddy >/dev/null 2>&1 && systemctl list-unit-files caddy.service >/dev/null 2>&1; then
                 systemctl enable caddy.service >/dev/null 2>&1 || true
                 systemctl reload-or-restart caddy.service >/dev/null 2>&1 || true
-            elif ! command -v caddy >/dev/null 2>&1; then
-                echo "[Vanill-IA OS] Note: Caddy is not installed yet. Run install.sh or install caddy to serve the WebOS over HTTPS."
             fi
 
             if systemctl is-active --quiet fail2ban.service 2>/dev/null; then
                 systemctl reload fail2ban.service >/dev/null 2>&1 || true
             fi
+        fi
+
+        SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        SERVER_IP="${SERVER_IP:-127.0.0.1}"
+
+        if [[ "${TLS_CONFLICT_DETECTED}" -eq 1 ]]; then
+            echo ""
+            echo "=================================================================="
+            echo " [CADDY TLS] Existing public domain block(s) detected in Caddy."
+            echo " Disabled catch-all 'tls internal' to preserve Let's Encrypt."
+            echo " Local HTTP URL : http://${SERVER_IP}:${ACTIVE_HTTP_PORT}"
+            echo ""
+            echo " To expose Vanill-IA OS on a Let's Encrypt HTTPS subdomain, add:"
+            echo "   os.yourdomain.com {"
+            echo "       reverse_proxy 127.0.0.1:${ACTIVE_HTTP_PORT}"
+            echo "   }"
+            echo "=================================================================="
         fi
 
         if [[ -n "${SETUP_TOKEN_DISPLAY}" ]]; then

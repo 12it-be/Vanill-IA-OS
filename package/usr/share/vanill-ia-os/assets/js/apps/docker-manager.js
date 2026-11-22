@@ -16,6 +16,21 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
+function formatCompactCount(num) {
+  const n = Number(num) || 0;
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
+}
+
+function formatTagSize(bytes) {
+  const b = Number(bytes) || 0;
+  if (b <= 0) return '';
+  if (b >= 1_073_741_824) return ` (${(b / 1_073_741_824).toFixed(2)} GB)`;
+  return ` (${(b / 1_048_576).toFixed(1)} MB)`;
+}
+
 /**
  * Coloration syntaxique légère temps réel pour docker-compose.yml
  */
@@ -41,13 +56,27 @@ function highlightYaml(raw) {
 
 export async function mountApp({ container, api, params }) {
   let activeTab = params?.tab || 'containers';
-  let overview = { agent_online: false, docker_info: null, containers: [], routes: [] };
+  let overview = {
+    agent_online: false,
+    docker_status: { installed: false, running: false, compose_available: false, installing: false, install_exit_code: null, log_tail: '' },
+    docker_info: null,
+    containers: [],
+    routes: [],
+  };
   let stacks = [];
   let catalog = [];
   let searchQuery = '';
   let stateFilter = 'all';
   let storeCategory = 'all';
+  let storeSearchQuery = '';
+  let hubQuery = '';
+  let hubOfficialOnly = true;
+  let hubResults = [];
+  let hubLoading = false;
+  let hubLoadedOnce = false;
+  let hubDebounceTimer = null;
   let refreshTimer = null;
+  let installPollTimer = null;
   let currentStack = { name: '', compose_yml: '', env_content: '', isNew: true };
 
   container.innerHTML = `
@@ -76,7 +105,124 @@ export async function mountApp({ container, api, params }) {
   const modalSlot = container.querySelector('#dockerModalSlot');
   const countBadge = container.querySelector('#navCountContainers');
 
-  const notify = (msg, type = 'info') => window.__VANILLIA_DESKTOP__?.toast(msg, type);
+  const notify = (msg, type = 'info') => window.__VANILLIA_DESKTOP__?.notify(msg, type);
+
+  function stopInstallPolling() {
+    if (installPollTimer) {
+      clearInterval(installPollTimer);
+      installPollTimer = null;
+    }
+  }
+
+  function startInstallPolling() {
+    if (installPollTimer) return;
+    installPollTimer = setInterval(async () => {
+      try {
+        const st = await api.get('/api/docker.php?action=engine_status');
+        overview.docker_status = st;
+        const logPre = mainPane.querySelector('#dockerLiveInstallLog');
+        if (logPre && st.log_tail) {
+          logPre.textContent = st.log_tail;
+          logPre.scrollTop = logPre.scrollHeight;
+        }
+        if (!st.installing) {
+          stopInstallPolling();
+          if (st.installed && st.running) {
+            notify(t('docker.install_done_toast'), { level: 'success' });
+            await switchTab(activeTab);
+          } else {
+            await switchTab(activeTab);
+          }
+        }
+      } catch (_) {}
+    }, 1500);
+  }
+
+  function renderDockerReadinessBanner() {
+    const ds = overview.docker_status || {};
+    if (!overview.agent_online) {
+      return `<div class="os-alert os-alert-info">System daemon <code>vanill-ia-agent</code> is offline on this preview host.</div>`;
+    }
+
+    if (ds.installing) {
+      startInstallPolling();
+      return `
+        <div class="settings-card" style="border-color:rgba(255,109,90,0.45);">
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">
+            <div style="width:22px;height:22px;border-radius:50%;border:3px solid rgba(255,109,90,0.25);border-top-color:var(--os-accent);animation:vDockerSpin 0.85s linear infinite;flex-shrink:0;"></div>
+            <style>@keyframes vDockerSpin { to { transform: rotate(360deg); } }</style>
+            <h3 style="margin:0;">⚙️ ${escapeHtml(t('docker.installing_title'))}</h3>
+          </div>
+          <p class="desc">${escapeHtml(t('docker.installing_desc'))}</p>
+          <pre class="log-console selectable" id="dockerLiveInstallLog" style="max-height:280px;">${escapeHtml(ds.log_tail || 'Initializing background installer...')}</pre>
+        </div>
+      `;
+    }
+
+    if (!ds.installed) {
+      const prevFailed = ds.install_exit_code !== null && ds.install_exit_code !== 0 && ds.log_tail;
+      return `
+        <div class="settings-card" style="padding:26px;text-align:center;border-color:var(--os-border-strong);">
+          <div style="width:52px;height:52px;border-radius:15px;background:rgba(14,165,233,0.16);color:#38BDF8;display:inline-flex;align-items:center;justify-content:center;margin-bottom:12px;">
+            ${getAppIconSvg('layers')}
+          </div>
+          <h3 style="font-size:1.08rem;margin-bottom:6px;">${escapeHtml(t('docker.baremetal_title'))}</h3>
+          <p class="desc" style="max-width:560px;margin:0 auto 16px;">${escapeHtml(t('docker.baremetal_desc'))}</p>
+          <button type="button" class="os-btn os-btn-primary" id="installDockerEngineBtn" style="width:auto;padding:11px 22px;">
+            ⚡ ${escapeHtml(t('docker.install_engine_btn'))}
+          </button>
+          ${prevFailed ? `
+            <details style="margin-top:16px;text-align:left;">
+              <summary style="cursor:pointer;font-size:0.78rem;color:var(--os-danger);">Last installation log (exit code ${ds.install_exit_code})</summary>
+              <pre class="log-console selectable" style="margin-top:8px;max-height:200px;">${escapeHtml(ds.log_tail)}</pre>
+            </details>
+          ` : ''}
+        </div>
+      `;
+    }
+
+    if (!ds.running) {
+      return `
+        <div class="settings-card" style="padding:24px;text-align:center;border-color:rgba(245,158,11,0.45);">
+          <h3 style="color:var(--os-warning);margin-bottom:6px;">⚠️ ${escapeHtml(t('docker.stopped_service_title'))}</h3>
+          <p class="desc" style="max-width:500px;margin:0 auto 14px;">${escapeHtml(t('docker.stopped_service_desc'))}</p>
+          <button type="button" class="os-btn os-btn-primary" id="startDockerServiceBtn" style="width:auto;">
+            ▶ ${escapeHtml(t('docker.start_service_btn'))}
+          </button>
+        </div>
+      `;
+    }
+
+    return '';
+  }
+
+  function bindDockerReadinessButtons() {
+    mainPane.querySelector('#installDockerEngineBtn')?.addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        const st = await api.post('/api/docker.php?action=install_engine', {});
+        overview.docker_status = st;
+        if (activeTab === 'store') renderStoreView();
+        else renderContainersView();
+        startInstallPolling();
+      } catch (err) {
+        notify(err.message, 'error');
+        e.currentTarget.disabled = false;
+      }
+    });
+
+    mainPane.querySelector('#startDockerServiceBtn')?.addEventListener('click', async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        const st = await api.post('/api/docker.php?action=start_service', {});
+        overview.docker_status = st;
+        await switchTab(activeTab);
+      } catch (err) {
+        notify(err.message, 'error');
+        e.currentTarget.disabled = false;
+      }
+    });
+  }
 
   const switchTab = async (tab) => {
     activeTab = tab;
@@ -126,6 +272,13 @@ export async function mountApp({ container, api, params }) {
   }
 
   function renderContainersView() {
+    const ds = overview.docker_status || {};
+    if (!overview.agent_online || ds.installing || !ds.installed || !ds.running) {
+      mainPane.innerHTML = renderDockerReadinessBanner();
+      bindDockerReadinessButtons();
+      return;
+    }
+
     const info = overview.docker_info;
     const list = (overview.containers || []).filter((c) => {
       const matchesSearch = searchQuery === '' ||
@@ -138,11 +291,9 @@ export async function mountApp({ container, api, params }) {
       return matchesSearch && matchesState;
     });
 
-    const offlineNotice = !overview.agent_online
-      ? `<div class="os-alert os-alert-info">Le daemon <code>vanill-ia-agent</code> n'est pas actif sur cet environnement. Déployez le paquet <code>.deb</code> sur Debian pour piloter <code>/var/run/docker.sock</code> en direct.</div>`
-      : overview.docker_error
-        ? `<div class="os-alert os-alert-error">${escapeHtml(overview.docker_error)}</div>`
-        : '';
+    const offlineNotice = overview.docker_error
+      ? `<div class="os-alert os-alert-error">${escapeHtml(overview.docker_error)}</div>`
+      : '';
 
     mainPane.innerHTML = `
       ${offlineNotice}
@@ -665,32 +816,136 @@ export async function mountApp({ container, api, params }) {
   }
 
   // ==========================================================================
-  // TAB 3: 1-CLICK SELF-HOSTED APP CATALOG (100% TRANSPARENT COMPOSE STACKS)
+  // TAB 3: APP STORE CATALOG & OFFICIAL DOCKER HUB SEARCH
   // ==========================================================================
 
   async function loadStoreTab() {
     try {
-      const res = await api.get('/api/docker.php?action=catalog');
+      const res = await api.get('/api/docker.php?action=store_catalog&refresh=0');
       catalog = res.catalog || [];
+      if (res.docker_status) {
+        overview.docker_status = res.docker_status;
+      }
+      if (typeof res.agent_online === 'boolean') {
+        overview.agent_online = res.agent_online;
+      }
       renderStoreView();
+      if (!hubLoadedOnce) {
+        hubLoadedOnce = true;
+        fetchHubResults();
+      }
     } catch (err) {
       mainPane.innerHTML = `<div class="os-alert os-alert-error">${escapeHtml(err.message)}</div>`;
     }
   }
 
+  async function fetchHubResults() {
+    hubLoading = true;
+    renderHubResultsZone();
+    try {
+      const res = await api.get(
+        `/api/docker.php?action=hub_search&q=${encodeURIComponent(hubQuery)}&official_only=${hubOfficialOnly ? '1' : '0'}`
+      );
+      hubResults = res.results || [];
+    } catch (err) {
+      hubResults = [];
+      const zone = mainPane.querySelector('#hubResultsZone');
+      if (zone) {
+        zone.innerHTML = `<div class="os-alert os-alert-error" style="grid-column:1/-1;">${escapeHtml(err.message)}</div>`;
+        hubLoading = false;
+        return;
+      }
+    }
+    hubLoading = false;
+    renderHubResultsZone();
+  }
+
+  function renderHubResultsZone() {
+    const zone = mainPane.querySelector('#hubResultsZone');
+    if (!zone) return;
+
+    const ds = overview.docker_status || {};
+    const dockerReady = overview.agent_online && ds.installed && ds.running && !ds.installing;
+
+    if (hubLoading) {
+      zone.innerHTML = `<div class="settings-card" style="grid-column:1/-1;text-align:center;padding:24px;">${escapeHtml(t('common.loading'))}</div>`;
+      return;
+    }
+
+    if (hubResults.length === 0) {
+      zone.innerHTML = `<div class="settings-card" style="grid-column:1/-1;text-align:center;padding:24px;color:var(--os-text-secondary);">${escapeHtml(t('docker.hub_no_results'))}</div>`;
+      return;
+    }
+
+    zone.innerHTML = hubResults.map((item, idx) => `
+      <article class="entity-card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+          <div style="min-width:0;">
+            <strong style="font-family:var(--font-mono);font-size:0.95rem;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">
+              ${escapeHtml(item.repo_name)}
+            </strong>
+          </div>
+          ${item.is_official ? `<span class="status-pill-sm status-running">✓ ${escapeHtml(t('docker.hub_official_badge'))}</span>` : ''}
+        </div>
+
+        <div style="font-size:0.79rem;color:var(--os-text-secondary);line-height:1.45;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;min-height:36px;">
+          ${escapeHtml(item.short_description || '—')}
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:auto;padding-top:8px;border-top:1px solid var(--os-border);">
+          <div style="display:flex;gap:10px;font-family:var(--font-mono);font-size:0.73rem;color:var(--os-text-muted);">
+            <span>★ ${formatCompactCount(item.star_count)}</span>
+            <span>⬇ ${formatCompactCount(item.pull_count)}</span>
+          </div>
+          <button type="button" class="btn-xs primary" data-hub-deploy="${idx}" ${!dockerReady ? 'disabled style="opacity:0.45;"' : ''}>
+            🚀 ${escapeHtml(t('docker.hub_deploy_btn'))}
+          </button>
+        </div>
+      </article>
+    `).join('');
+
+    zone.querySelectorAll('[data-hub-deploy]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const picked = hubResults[Number(btn.dataset.hubDeploy)];
+        if (picked) openHubDeployModal(picked);
+      });
+    });
+  }
+
   function renderStoreView() {
     const categories = ['all', ...new Set(catalog.map((a) => a.category))];
-    const filtered = catalog.filter((a) => storeCategory === 'all' || a.category === storeCategory);
+    const qLower = storeSearchQuery.trim().toLowerCase();
+    const filtered = catalog.filter((a) => {
+      const catOk = storeCategory === 'all' || a.category === storeCategory;
+      const searchOk = qLower === '' ||
+        a.name.toLowerCase().includes(qLower) ||
+        (a.tagline || '').toLowerCase().includes(qLower) ||
+        (a.description || '').toLowerCase().includes(qLower);
+      return catOk && searchOk;
+    });
+
+    const ds = overview.docker_status || {};
+    const dockerReady = overview.agent_online && ds.installed && ds.running && !ds.installing;
+    const readinessHtml = !dockerReady ? renderDockerReadinessBanner() : '';
+    const quickTags = ['nginx', 'postgres', 'redis', 'mariadb', 'grafana', 'wordpress', 'caddy', 'alpine'];
 
     mainPane.innerHTML = `
-      <div class="settings-card" style="padding:14px 18px;">
-        <div class="toolbar-row">
+      ${readinessHtml}
+
+      <!-- SECTION 1: READY-TO-USE COMPOSE APP CATALOG -->
+      <div class="settings-card" style="padding:15px 18px;">
+        <div class="toolbar-row" style="margin-bottom:10px;">
           <div>
-            <h3 style="margin:0;">Catalogue d'Applications Auto-Hébergées</h3>
-            <p class="desc" style="margin:2px 0 0;">Zéro boîte noire : chaque application génère un vrai fichier <code>docker-compose.yml</code> modifiable dans <code>/opt/vanill-ia/stacks/</code>.</p>
+            <h3 style="margin:0;">📦 ${escapeHtml(t('docker.catalog_section_title'))}</h3>
+            <p class="desc" style="margin:2px 0 0;">${escapeHtml(t('docker.catalog_section_desc'))}</p>
           </div>
-          <select class="os-select" id="storeCategorySel" style="max-width:220px;">
-            ${categories.map((cat) => `<option value="${escapeHtml(cat)}" ${storeCategory === cat ? 'selected' : ''}>${cat === 'all' ? 'Toutes les catégories' : escapeHtml(cat)}</option>`).join('')}
+          <button type="button" class="btn-xs" id="refreshOnlineCatalogBtn">🔄 ${escapeHtml(t('docker.catalog_refresh_btn'))}</button>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <input type="search" class="os-input" id="storeSearchInput" value="${escapeHtml(storeSearchQuery)}" placeholder="${escapeHtml(t('docker.catalog_search_ph'))}" style="max-width:280px;padding:7px 12px;font-size:0.83rem;">
+          <select class="os-select" id="storeCategorySel" style="max-width:220px;padding:7px 12px;font-size:0.83rem;">
+            ${categories.map((cat) => `<option value="${escapeHtml(cat)}" ${storeCategory === cat ? 'selected' : ''}>${cat === 'all' ? escapeHtml(t('docker.catalog_all_cats')) : escapeHtml(cat)}</option>`).join('')}
           </select>
         </div>
       </div>
@@ -705,7 +960,7 @@ export async function mountApp({ container, api, params }) {
               <div style="min-width:0;flex:1;">
                 <div style="display:flex;align-items:center;gap:7px;">
                   <strong style="font-size:0.96rem;">${escapeHtml(app.name)}</strong>
-                  ${app.installed ? `<span class="status-pill-sm status-running">Installé</span>` : ''}
+                  ${app.installed ? `<span class="status-pill-sm status-running">✓</span>` : ''}
                 </div>
                 <div style="font-size:0.74rem;color:var(--os-text-secondary);">${escapeHtml(app.category)} · Port ${app.default_port}</div>
               </div>
@@ -715,19 +970,91 @@ export async function mountApp({ container, api, params }) {
             <div style="font-size:0.78rem;color:var(--os-text-secondary);line-height:1.45;">${escapeHtml(app.description)}</div>
 
             <div style="display:flex;gap:8px;margin-top:auto;padding-top:6px;">
-              <button type="button" class="btn-xs primary" data-deploy-slug="${escapeHtml(app.slug)}">
-                ${app.installed ? '↻ Reconfigurer / Redéployer' : '⚡ Installer en 1 clic'}
+              <button type="button" class="btn-xs primary" data-deploy-slug="${escapeHtml(app.slug)}" ${!dockerReady ? 'disabled style="opacity:0.45;"' : ''}>
+                ${app.installed ? '↻ Redeploy' : '⚡ 1-Click Install'}
               </button>
-              <button type="button" class="btn-xs" data-edit-template="${escapeHtml(app.slug)}">Éditer YAML</button>
+              <button type="button" class="btn-xs" data-edit-template="${escapeHtml(app.slug)}" ${!dockerReady ? 'disabled style="opacity:0.45;"' : ''}>YAML</button>
             </div>
           </article>
         `).join('')}
       </div>
+
+      <!-- SECTION 2: OFFICIAL DOCKER HUB SEARCH -->
+      <div class="settings-card" style="padding:16px 18px;margin-top:8px;">
+        <div class="toolbar-row" style="margin-bottom:10px;">
+          <div>
+            <h3 style="margin:0;">🐳 ${escapeHtml(t('docker.hub_section_title'))}</h3>
+            <p class="desc" style="margin:2px 0 0;">${escapeHtml(t('docker.hub_section_desc'))}</p>
+          </div>
+          <label style="display:inline-flex;align-items:center;gap:7px;font-size:0.82rem;font-weight:600;cursor:pointer;">
+            <input type="checkbox" id="hubOfficialChk" ${hubOfficialOnly ? 'checked' : ''}>
+            ${escapeHtml(t('docker.hub_official_only'))}
+          </label>
+        </div>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <input type="search" class="os-input" id="hubSearchInput" value="${escapeHtml(hubQuery)}" placeholder="${escapeHtml(t('docker.hub_search_ph'))}" style="flex:1;min-width:240px;padding:8px 13px;font-size:0.85rem;">
+        </div>
+
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:10px;">
+          ${quickTags.map((qt) => `<button type="button" class="btn-xs" data-hub-preset="${qt}" style="font-family:var(--font-mono);">${qt}</button>`).join('')}
+        </div>
+      </div>
+
+      <div class="cards-grid" id="hubResultsZone"></div>
     `;
+
+    bindDockerReadinessButtons();
+    renderHubResultsZone();
+
+    mainPane.querySelector('#refreshOnlineCatalogBtn').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true;
+      try {
+        const res = await api.get('/api/docker.php?action=store_catalog&refresh=1');
+        catalog = res.catalog || [];
+        notify(t('docker.catalog_refreshed_toast'), { level: 'success' });
+        renderStoreView();
+      } catch (err) {
+        notify(err.message, 'error');
+        btn.disabled = false;
+      }
+    });
+
+    const catSearch = mainPane.querySelector('#storeSearchInput');
+    catSearch.addEventListener('input', () => {
+      storeSearchQuery = catSearch.value;
+      renderStoreView();
+      const inp = mainPane.querySelector('#storeSearchInput');
+      inp?.focus();
+      inp?.setSelectionRange(inp.value.length, inp.value.length);
+    });
 
     mainPane.querySelector('#storeCategorySel').addEventListener('change', (e) => {
       storeCategory = e.target.value;
       renderStoreView();
+    });
+
+    const hubInput = mainPane.querySelector('#hubSearchInput');
+    hubInput.addEventListener('input', () => {
+      hubQuery = hubInput.value;
+      if (hubDebounceTimer) clearTimeout(hubDebounceTimer);
+      hubDebounceTimer = setTimeout(() => {
+        fetchHubResults();
+      }, 400);
+    });
+
+    mainPane.querySelector('#hubOfficialChk').addEventListener('change', (e) => {
+      hubOfficialOnly = e.target.checked;
+      fetchHubResults();
+    });
+
+    mainPane.querySelectorAll('[data-hub-preset]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        hubQuery = btn.dataset.hubPreset;
+        hubInput.value = hubQuery;
+        fetchHubResults();
+      });
     });
 
     mainPane.querySelectorAll('[data-edit-template]').forEach((btn) => {
@@ -749,6 +1076,220 @@ export async function mountApp({ container, api, params }) {
         const tpl = catalog.find((x) => x.slug === btn.dataset.deploySlug);
         if (tpl) openDeployModal(tpl);
       });
+    });
+  }
+
+  /**
+   * Opens the Quick Configuration & Deployment Modal for any Docker Hub image.
+   */
+  async function openHubDeployModal(repoItem) {
+    const repoName = repoItem.repo_name;
+    const defaultSlug = repoName.split('/').pop().toLowerCase().replace(/[^a-z0-9_-]/g, '-').replace(/^-+|-+$/g, '') || 'app';
+
+    modalSlot.innerHTML = `
+      <div class="inwin-modal-backdrop">
+        <div class="inwin-modal" style="max-width:620px;">
+          <div class="inwin-modal-header">
+            <span>🐳 ${escapeHtml(t('docker.hub_modal_title'))} — <code>${escapeHtml(repoName)}</code></span>
+            <button type="button" class="btn-xs" id="closeHubDeployModal">${escapeHtml(t('common.close'))}</button>
+          </div>
+
+          <div class="inwin-modal-body">
+            <form id="hubDeployForm" style="display:flex;flex-direction:column;gap:12px;">
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;">
+                <div>
+                  <label class="form-label">${escapeHtml(t('docker.hub_service_name'))}</label>
+                  <input type="text" class="os-input" name="name" id="hubSvcNameInp" value="${escapeHtml(defaultSlug)}" pattern="[a-z0-9][a-z0-9_-]{0,47}" required style="font-family:var(--font-mono);">
+                </div>
+                <div>
+                  <label class="form-label">${escapeHtml(t('docker.hub_tag_label'))}</label>
+                  <select class="os-select" name="tag" id="hubTagSelect" style="font-family:var(--font-mono);">
+                    <option value="latest">latest</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="form-label">${escapeHtml(t('docker.hub_restart_label'))}</label>
+                  <select class="os-select" name="restart_policy">
+                    <option value="unless-stopped" selected>unless-stopped</option>
+                    <option value="always">always</option>
+                    <option value="on-failure">on-failure</option>
+                    <option value="no">no</option>
+                  </select>
+                </div>
+              </div>
+
+              <!-- Dynamic Ports -->
+              <div class="settings-card" style="padding:12px;">
+                <div class="toolbar-row" style="margin-bottom:8px;">
+                  <label class="form-label" style="margin:0;">${escapeHtml(t('docker.hub_ports_label'))}</label>
+                  <button type="button" class="btn-xs" id="hubAddPortBtn">${escapeHtml(t('docker.hub_add_port'))}</button>
+                </div>
+                <div id="hubPortsRows" style="display:flex;flex-direction:column;gap:6px;"></div>
+              </div>
+
+              <!-- Dynamic Volumes -->
+              <div class="settings-card" style="padding:12px;">
+                <div class="toolbar-row" style="margin-bottom:8px;">
+                  <label class="form-label" style="margin:0;">${escapeHtml(t('docker.hub_volumes_label'))}</label>
+                  <button type="button" class="btn-xs" id="hubAddVolBtn">${escapeHtml(t('docker.hub_add_volume'))}</button>
+                </div>
+                <div id="hubVolsRows" style="display:flex;flex-direction:column;gap:6px;"></div>
+              </div>
+
+              <!-- Dynamic Environment Variables -->
+              <div class="settings-card" style="padding:12px;">
+                <div class="toolbar-row" style="margin-bottom:8px;">
+                  <label class="form-label" style="margin:0;">${escapeHtml(t('docker.hub_env_label'))}</label>
+                  <button type="button" class="btn-xs" id="hubAddEnvBtn">${escapeHtml(t('docker.hub_add_env'))}</button>
+                </div>
+                <div id="hubEnvsRows" style="display:flex;flex-direction:column;gap:6px;"></div>
+              </div>
+
+              <label style="display:inline-flex;align-items:center;gap:8px;font-size:0.83rem;cursor:pointer;">
+                <input type="checkbox" name="pin_desktop" checked>
+                ${escapeHtml(t('docker.hub_pin_desktop'))}
+              </label>
+
+              <button type="submit" class="os-btn os-btn-primary" id="hubConfirmDeployBtn">🚀 ${escapeHtml(t('docker.hub_launch_deploy'))}</button>
+            </form>
+
+            <pre class="log-console hidden selectable" id="hubDeployLogPre"></pre>
+          </div>
+        </div>
+      </div>
+    `;
+
+    modalSlot.querySelector('#closeHubDeployModal').addEventListener('click', () => { modalSlot.innerHTML = ''; });
+
+    const nameInp = modalSlot.querySelector('#hubSvcNameInp');
+    const tagSel = modalSlot.querySelector('#hubTagSelect');
+    const portsBox = modalSlot.querySelector('#hubPortsRows');
+    const volsBox = modalSlot.querySelector('#hubVolsRows');
+    const envsBox = modalSlot.querySelector('#hubEnvsRows');
+    const logPre = modalSlot.querySelector('#hubDeployLogPre');
+    const submitBtn = modalSlot.querySelector('#hubConfirmDeployBtn');
+
+    const appendPortRow = (hostVal = '', contVal = '', proto = 'tcp') => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:grid;grid-template-columns:1fr auto 1fr 90px auto;gap:6px;align-items:center;';
+      row.innerHTML = `
+        <input type="number" class="os-input" data-p-host placeholder="8080" value="${escapeHtml(hostVal)}" min="1" max="65535" style="min-width:0;padding:6px 10px;font-family:var(--font-mono);">
+        <span>:</span>
+        <input type="number" class="os-input" data-p-cont placeholder="80" value="${escapeHtml(contVal)}" min="1" max="65535" style="min-width:0;padding:6px 10px;font-family:var(--font-mono);">
+        <select class="os-select" data-p-proto style="min-width:0;padding:6px 8px;">
+          <option value="tcp" ${proto === 'tcp' ? 'selected' : ''}>TCP</option>
+          <option value="udp" ${proto === 'udp' ? 'selected' : ''}>UDP</option>
+        </select>
+        <button type="button" class="btn-xs danger" data-rm-row>✕</button>
+      `;
+      row.querySelector('[data-rm-row]').addEventListener('click', () => row.remove());
+      portsBox.appendChild(row);
+    };
+
+    const appendVolRow = (hostPath = '', contPath = '/data') => {
+      const slugNow = nameInp.value.trim() || defaultSlug;
+      const resolvedHost = hostPath || `/var/lib/vanill-ia-os/stacks/${slugNow}/data`;
+      const row = document.createElement('div');
+      row.style.cssText = 'display:grid;grid-template-columns:1.4fr auto 1fr auto;gap:6px;align-items:center;';
+      row.innerHTML = `
+        <input type="text" class="os-input" data-v-host value="${escapeHtml(resolvedHost)}" placeholder="/var/lib/vanill-ia-os/stacks/${escapeHtml(slugNow)}/data" style="min-width:0;padding:6px 10px;font-family:var(--font-mono);font-size:0.78rem;">
+        <span>:</span>
+        <input type="text" class="os-input" data-v-cont value="${escapeHtml(contPath)}" placeholder="/data" style="min-width:0;padding:6px 10px;font-family:var(--font-mono);font-size:0.78rem;">
+        <button type="button" class="btn-xs danger" data-rm-row>✕</button>
+      `;
+      row.querySelector('[data-rm-row]').addEventListener('click', () => row.remove());
+      volsBox.appendChild(row);
+    };
+
+    const appendEnvRow = (keyVal = '', valStr = '') => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:grid;grid-template-columns:1fr auto 1.3fr auto;gap:6px;align-items:center;';
+      row.innerHTML = `
+        <input type="text" class="os-input" data-e-key value="${escapeHtml(keyVal)}" placeholder="KEY" style="min-width:0;padding:6px 10px;font-family:var(--font-mono);font-size:0.79rem;">
+        <span>=</span>
+        <input type="text" class="os-input" data-e-val value="${escapeHtml(valStr)}" placeholder="value" style="min-width:0;padding:6px 10px;font-family:var(--font-mono);font-size:0.79rem;">
+        <button type="button" class="btn-xs danger" data-rm-row>✕</button>
+      `;
+      row.querySelector('[data-rm-row]').addEventListener('click', () => row.remove());
+      envsBox.appendChild(row);
+    };
+
+    // Pre-seed 1 port row + 1 persistent volume row for quick convenience
+    appendPortRow('', '');
+    appendVolRow('', '');
+
+    modalSlot.querySelector('#hubAddPortBtn').addEventListener('click', () => appendPortRow());
+    modalSlot.querySelector('#hubAddVolBtn').addEventListener('click', () => appendVolRow('', '/data'));
+    modalSlot.querySelector('#hubAddEnvBtn').addEventListener('click', () => appendEnvRow());
+
+    // Load official tags asynchronously from Docker Hub API
+    api.get(`/api/docker.php?action=hub_tags&repo=${encodeURIComponent(repoName)}`)
+      .then((res) => {
+        const tags = res.tags || [];
+        if (tags.length > 0) {
+          tagSel.innerHTML = tags.map((tg) => `
+            <option value="${escapeHtml(tg.name)}">${escapeHtml(tg.name)}${escapeHtml(formatTagSize(tg.full_size))}</option>
+          `).join('');
+        }
+      })
+      .catch(() => {});
+
+    modalSlot.querySelector('#hubDeployForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fd = new FormData(e.currentTarget);
+
+      const ports = [];
+      portsBox.querySelectorAll('div').forEach((r) => {
+        const host = r.querySelector('[data-p-host]')?.value.trim() || '';
+        const container = r.querySelector('[data-p-cont]')?.value.trim() || '';
+        const proto = r.querySelector('[data-p-proto]')?.value || 'tcp';
+        if (host && container) {
+          ports.push({ host, container, proto });
+        }
+      });
+
+      const volumes = [];
+      volsBox.querySelectorAll('div').forEach((r) => {
+        const host = r.querySelector('[data-v-host]')?.value.trim() || '';
+        const container = r.querySelector('[data-v-cont]')?.value.trim() || '';
+        if (host && container) {
+          volumes.push({ host, container });
+        }
+      });
+
+      const env = [];
+      envsBox.querySelectorAll('div').forEach((r) => {
+        const key = r.querySelector('[data-e-key]')?.value.trim() || '';
+        const value = r.querySelector('[data-e-val]')?.value ?? '';
+        if (key) {
+          env.push({ key, value });
+        }
+      });
+
+      submitBtn.disabled = true;
+      logPre.classList.remove('hidden');
+      logPre.textContent = `Generating docker-compose.yml and deploying ${repoName}:${fd.get('tag')}...`;
+
+      try {
+        const res = await api.post('/api/docker.php?action=deploy_image', {
+          name: fd.get('name'),
+          image: repoName,
+          tag: fd.get('tag'),
+          restart_policy: fd.get('restart_policy'),
+          ports,
+          volumes,
+          env,
+          pin_desktop: fd.get('pin_desktop') === 'on',
+        });
+
+        await window.__VANILLIA_DESKTOP__?.loadShortcuts();
+        notify(t('docker.hub_deployed_toast', { image: res.image }), { level: 'success' });
+        modalSlot.innerHTML = '';
+        await switchTab('containers');
+      } catch (err) {
+        logPre.textContent = `[ERROR] ${err.message}`;
+        submitBtn.disabled = false;
+      }
     });
   }
 
@@ -970,6 +1511,8 @@ export async function mountApp({ container, api, params }) {
   return {
     cleanup() {
       if (refreshTimer) clearInterval(refreshTimer);
+      if (hubDebounceTimer) clearTimeout(hubDebounceTimer);
+      stopInstallPolling();
       window.removeEventListener('vanillia:lang-changed', onLangChanged);
     },
     onLaunch(newParams) {

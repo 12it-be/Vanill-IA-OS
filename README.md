@@ -7,7 +7,11 @@
 ## Quick One-Liner Install
 
 ```bash
-curl -fsSL https://install.vanill-ia.com | sudo bash
+# Lightweight bare-metal install (no Docker overhead; Docker installable in 1 click from UI):
+curl -fsSL https://install.vanill-ia.com/install.sh | sudo bash
+
+# Optional: install with Docker Engine & Compose pre-configured:
+curl -fsSL https://install.vanill-ia.com/install.sh | sudo bash -s -- --with-docker
 ```
 
 ---
@@ -19,8 +23,8 @@ curl -fsSL https://install.vanill-ia.com | sudo bash
   - Built-in **i18n (`English` default + persistent per-user `Français`)** with live language switching without closing open windows.
 - **Hot-Loadable Plugin Architecture (`/var/lib/vanill-ia-os/apps/[app]/manifest.json`)** :
   - Drop a plugin folder with `manifest.json` (`"launchMode": "window"` sandboxed iframe or `"launchMode": "external"` new tab) — zero `.deb` rebuild required.
-- **Docker, Compose Stacks, 1-Click App Store & Caddy Reverse Proxy** :
-  - Transparent `docker-compose.yml` management in `/opt/vanill-ia/stacks/`, live container metrics/logs/`docker exec`, and 2-click HTTPS Caddy subdomain routing.
+- **Docker, Compose Stacks, App Store, Official Docker Hub Search & Caddy Proxy** :
+  - Transparent `docker-compose.yml` management in `/opt/vanill-ia/stacks/`, online-syncable curated App Store, live official **Docker Hub** repository & tag search with visual Ports/Volumes/Env Compose builder, live container metrics/logs/`docker exec`, and 2-click HTTPS Caddy subdomain routing.
 - **System Administration, Files & Ephemeral SMB/CIFS Mount** :
   - Live **Resource Monitor** & SMART health, **System Settings** (Storage, Samba, Tailscale, UFW, Fail2ban, Systemd, APT), visual **Cron Scheduler**, **Files** explorer (Drag & Drop upload, Zip/Unzip, `chmod`/`chown`, media preview), multi-tab **Code Editor**, **Markdown Notes**, and interactive **Terminal**.
   - Native **Mount** app for remote SMB/CIFS shares using ephemeral `/tmp/.smb-cred-XXXX` (`0600`) immediately `unlink`ed after `mount` (**zero persistent secrets**).
@@ -37,13 +41,13 @@ curl -fsSL https://install.vanill-ia.com | sudo bash
 
 ```bash
 # Build natively on Debian / Ubuntu via dpkg-deb:
-bash build.sh 1.6.2
+bash build.sh 1.7.0
 
 # Or build portably via Node.js:
-node build-deb.mjs 1.6.2
+node build-deb.mjs 1.7.0
 
 # Install a local .deb package:
-sudo bash install.sh --local ./dist/vanill-ia-os_1.6.2_all.deb
+sudo bash install.sh --local ./dist/vanill-ia-os_1.7.0_all.deb
 sudo caddy validate --config /etc/caddy/Caddyfile
 ```
 

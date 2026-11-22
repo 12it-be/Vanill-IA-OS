@@ -8,7 +8,7 @@
  * ==============================================================================
  */
 
-const CACHE_VERSION = 'vanill-ia-os-v1.6.2';
+const CACHE_VERSION = 'vanill-ia-os-v1.7.0';
 const OFFLINE_URL = '/offline.html';
 
 const PRECACHE_ASSETS = [

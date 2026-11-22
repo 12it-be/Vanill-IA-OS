@@ -16,7 +16,7 @@ declare(strict_types=1);
 require_once __DIR__ . '/AgentClient.php';
 require_once __DIR__ . '/Totp.php';
 
-const VANILLIA_VERSION = '1.6.2';
+const VANILLIA_VERSION = '1.7.0';
 const VANILLIA_DATA_DIR = '/var/lib/vanill-ia-os/data';
 const VANILLIA_APPS_DIR = '/var/lib/vanill-ia-os/apps';
 const VANILLIA_SESSIONS_DIR = '/var/lib/vanill-ia-os/sessions';
