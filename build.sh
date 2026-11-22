@@ -92,7 +92,7 @@ if [[ -f "${STAGING_DIR}/DEBIAN/prerm" ]]; then
     chmod 0755 "${STAGING_DIR}/DEBIAN/prerm"
 fi
 chmod 0755 "${STAGING_DIR}/usr/local/bin/vanill-ia-agent"
-for helper_bin in vanill-ia-cron-run vanill-ia-os vanill-ia-browser-ctl; do
+for helper_bin in vanill-ia-cron-run vanill-ia-os vanill-ia-browser-ctl vanill-ia-docker-install; do
     if [[ -f "${STAGING_DIR}/usr/local/bin/${helper_bin}" ]]; then
         chmod 0755 "${STAGING_DIR}/usr/local/bin/${helper_bin}"
     fi

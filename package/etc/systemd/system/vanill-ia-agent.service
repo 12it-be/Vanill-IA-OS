@@ -2,7 +2,6 @@
 Description=Vanill-IA OS Privileged System Daemon
 Documentation=https://gitea.jn-dev.be/JN/Vanill-IA-OS
 After=network.target local-fs.target docker.service
-Wants=docker.service
 
 [Service]
 Type=simple
