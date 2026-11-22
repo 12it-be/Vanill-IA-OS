@@ -10,7 +10,7 @@
 # ==============================================================================
 set -euo pipefail
 
-GITHUB_REPO="${VANILLIA_GITHUB_REPO:-vanill-ia/vanill-ia-os}"
+GITHUB_REPO="${VANILLIA_GITHUB_REPO:-12it.be/vanill-ia-os}"
 LOCAL_DEB=""
 WITH_DOCKER=0
 TMP_DIR="$(mktemp -d -t vanill-ia-install-XXXXXX)"
