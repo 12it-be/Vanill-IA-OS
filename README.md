@@ -53,7 +53,7 @@ node build-deb.mjs 1.7.1
 sudo bash install.sh --local ./dist/vanill-ia-os_1.7.1_all.deb
 sudo caddy validate --config /etc/caddy/Caddyfile
 ```
-<img width="1220" height="2590" alt="Screenshot_2026-11-24-00-16-59-705_com microsoft emmx" src="https://github.com/user-attachments/assets/a7cdd59b-0a65-47b7-8238-10b75018d590" />
+<img width="auto" height="800" alt="Screenshot_2026-11-24-00-16-59-705_com microsoft emmx" src="https://github.com/user-attachments/assets/a7cdd59b-0a65-47b7-8238-10b75018d590" />
 
 
 ### Server CLI Recovery Commands
