@@ -2,6 +2,9 @@
 
 **Vanill-IA OS** is an ultra-lightweight, zero-bloat, open-source WebOS designed to administer any **Debian 12/13**, **Ubuntu 22.04/24.04+ LTS**, or **Raspberry Pi OS** server (VPS, mini-PC, Proxmox VM, home NAS, or bare-metal server) as an installable **Progressive Web App (PWA)**.
 
+<img width="1893" height="862" alt="01-desktop" src="https://github.com/user-attachments/assets/6c8ab9af-b775-4a2a-bbd9-9ebff2f8a127" />
+
+
 ---
 
 ## Quick One-Liner Install
@@ -50,6 +53,8 @@ node build-deb.mjs 1.7.1
 sudo bash install.sh --local ./dist/vanill-ia-os_1.7.1_all.deb
 sudo caddy validate --config /etc/caddy/Caddyfile
 ```
+<img width="1220" height="2590" alt="Screenshot_2026-11-24-00-16-59-705_com microsoft emmx" src="https://github.com/user-attachments/assets/a7cdd59b-0a65-47b7-8238-10b75018d590" />
+
 
 ### Server CLI Recovery Commands
 ```bash
