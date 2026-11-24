@@ -64,3 +64,9 @@ sudo vanill-ia-os reset-2fa <username>      # Emergency 2FA TOTP reset
 sudo vanill-ia-os unlock-ip all             # Clear SQLite rate-limiting lockouts
 sudo vanill-ia-browser-ctl status           # Check isolated Web Browser state & RAM
 ```
+<?php
+/**
+ * Vanill-IA OS — Lightweight Self-Hosted Linux WebOS
+ * Copyright (C) 2026 Julian Neuvens 12it.be
+ * Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)
+ */
